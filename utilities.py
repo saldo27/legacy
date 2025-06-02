@@ -72,57 +72,34 @@ class DateTimeUtils:
                 logging.warning(f"Invalid date range format '{date_range}' - {str(e)}")
         return ranges
     
-    def is_weekend_day(self, date, holidays=None):
+    def is_weekend_day(self, date, holidays_list=None):
         """
-        Check if date is a weekend day, holiday, or pre-holiday
-
-        Args:
-            date: datetime object
-            holidays: optional list of holidays (if None, no holiday check)
-        Returns:
-            bool: True if weekend/holiday/pre-holiday, False otherwise
-        """
-        # Check if it's a holiday
-        if holidays is not None:
-            if date in holidays:
-                return True
+        Check if a date is a weekend day or holiday
     
-            # Check if it's a pre-holiday (day before a holiday)
-            next_day = date + timedelta(days=1)
-            if next_day in holidays:
-                return True
-
-        # Check if it's a weekend (Friday, Saturday, Sunday)
-        return date.weekday() >= 4  # 4 = Friday, 5 = Saturday, 6 = Sunday
+        Args:
+            date: Date to check
+            holidays_list: Optional list of holiday dates to check against
+    
+        Returns:
+            bool: True if date is a weekend day (Fri, Sat, Sun) or holiday
+        """
+        if holidays_list is None:
+            holidays_list = []  # Default to empty list if not provided
         
-    def is_holiday(self, date, holidays=None):
-        """
-        Check if a date is a holiday
-    
-        Args:
-            date: datetime object
-            holidays: optional list of holidays
-        Returns:
-            bool: True if holiday, False otherwise
-        """
-        if holidays is None:
-            return False
-        return date in holidays
-
-    def is_pre_holiday(self, date, holidays=None):
-        """
-        Check if a date is the day before a holiday
-    
-        Args:
-            date: datetime object
-            holidays: optional list of holidays
-        Returns:
-            bool: True if pre-holiday, False otherwise
-        """
-        if holidays is None:
-            return False
+        # Check if it's Friday, Saturday or Sunday
+        if date.weekday() >= 4:  # 4=Friday, 5=Saturday, 6=Sunday
+            return True
+        
+        # Check if it's a holiday
+        if date in holidays_list:
+            return True
+        
+        # Check if it's a day before holiday (treated as special in some parts of the code)
         next_day = date + timedelta(days=1)
-        return next_day in holidays
+        if next_day in holidays_list:
+            return True
+        
+        return False
 
     def get_weekend_start(self, date, holidays=None):
         """

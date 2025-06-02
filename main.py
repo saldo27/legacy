@@ -10,7 +10,7 @@ from kivy.uix.checkbox import CheckBox
 from kivy.uix.popup import Popup
 from kivy.graphics import Color, Line, Rectangle
 from datetime import datetime, timedelta
-from scheduler import Scheduler
+from scheduler import  Scheduler, SchedulerError
 from exporters import StatsExporter
 from pdf_exporter import PDFExporter
 
@@ -43,11 +43,11 @@ class PasswordScreen(Screen):
         super(PasswordScreen, self).__init__(**kwargs)
         layout = BoxLayout(orientation='vertical', padding=50, spacing=20)
 
-        layout.add_widget(Label(text='Enter Password:', size_hint_y=None, height=40))
+        layout.add_widget(Label(text='Introduza la contraseña:', size_hint_y=None, height=40))
 
         self.password_input = TextInput(
             multiline=False,
-            password=True,  # Hides the entered characters
+            password=True,  
             size_hint_y=None,
             height=40,
             halign='center',
@@ -95,7 +95,7 @@ class PasswordScreen(Screen):
 class WelcomeScreen(Screen):
     def __init__(self, **kwargs):
         super(WelcomeScreen, self).__init__(**kwargs)
-        print("DEBUG: PasswordScreen __init__ called!") # <<< ADD THIS LINE
+        print("DEBUG: PasswordScreen __init__ called!") 
         layout = BoxLayout(orientation='vertical', padding=20, spacing=10)
         
         layout.add_widget(Label(text='Bienvenido'))
@@ -175,21 +175,53 @@ class SetupScreen(Screen):
         
         # Gap between shifts
         gap_container = BoxLayout(orientation='vertical')
-        gap_container.add_widget(Label(text='Diferencia mínima entre guardias:', halign='left', size_hint_y=0.4))
-        self.gap_between_shifts = TextInput(multiline=False, input_filter='int', text='1', size_hint_y=0.6)
+        gap_container.add_widget(Label(text='Distancia mínima entre guardias:', halign='left', size_hint_y=0.4))
+        self.gap_between_shifts = TextInput(multiline=False, input_filter='int', text='3', size_hint_y=0.6)
         gap_container.add_widget(self.gap_between_shifts)
         numbers_section.add_widget(gap_container)
         
         # Max consecutive weekends
         weekends_container = BoxLayout(orientation='vertical')
         weekends_container.add_widget(Label(text='Máx Findes/Festivos consecutivos:', halign='left', size_hint_y=0.4))
-        self.max_consecutive_weekends = TextInput(multiline=False, input_filter='int', text='2', size_hint_y=0.6)
+        self.max_consecutive_weekends = TextInput(multiline=False, input_filter='int', text='3', size_hint_y=0.6)
         weekends_container.add_widget(self.max_consecutive_weekends)
         numbers_section.add_widget(weekends_container)
         
         form_layout.add_widget(numbers_section)
         
         # Add spacing using a BoxLayout instead of Widget
+        form_layout.add_widget(BoxLayout(size_hint_y=None, height=10))
+
+        # ------ NEW SECTION: Variable Shifts by Date Range ------
+        shifts_header = BoxLayout(orientation='vertical', size_hint_y=None, height=40)
+        shifts_header.add_widget(Label(
+            text='Periodo con variación en guardias/día(opcional):',
+            halign='left',
+            valign='bottom',
+            bold=True
+        ))
+        form_layout.add_widget(shifts_header)
+
+        # Create container for variable shifts
+        self.variable_shifts_container = GridLayout(
+            cols=1,
+            size_hint_y=None,
+            height=0,  # Will be updated dynamically
+            spacing=5
+        )
+        self.variable_shifts_container.bind(minimum_height=self.variable_shifts_container.setter('height'))
+        form_layout.add_widget(self.variable_shifts_container)
+
+        # Add button to add new variable shift rows
+        add_shift_btn = Button(
+            text='+ Añadir Periodo con variación guardias/día',
+            size_hint_y=None,
+            height=40
+        )
+        add_shift_btn.bind(on_press=self.add_variable_shift_row)
+        form_layout.add_widget(add_shift_btn)
+
+        # Add some spacing
         form_layout.add_widget(BoxLayout(size_hint_y=None, height=10))
         
         # Holidays - given more space with a clear label
@@ -247,13 +279,16 @@ class SetupScreen(Screen):
         self.layout.add_widget(button_section)
         
         # Add the main layout to the screen
-        self.add_widget(self.layout)      
+        self.add_widget(self.layout)
+
+        # Keep track of variable shift rows
+        self.variable_shift_rows = []
 
     def save_config(self, instance):
         try:
             start_date_str = self.start_date.text.strip()
             end_date_str = self.end_date.text.strip()
-        
+    
             # Validate dates - using DD-MM-YYYY format
             try:
                 # Parse using DD-MM-YYYY format
@@ -264,27 +299,27 @@ class SetupScreen(Screen):
             except ValueError as e:
                 self.show_error(f"Invalid date format: {str(e)}\nUse DD-MM-YYYY format")
                 return
-        
+    
             # Validate numeric inputs
             try:
                 num_workers = int(self.num_workers.text)
                 num_shifts = int(self.num_shifts.text)
                 gap_between_shifts = int(self.gap_between_shifts.text)
                 max_consecutive_weekends = int(self.max_consecutive_weekends.text)
-            
+        
                 if num_workers <= 0 or num_shifts <= 0:
                     raise ValueError("Number of workers and shifts must be positive")
-            
+        
                 if gap_between_shifts < 0:
                     raise ValueError("Minimum days between shifts cannot be negative")
-            
+        
                 if max_consecutive_weekends <= 0:
                     raise ValueError("Maximum consecutive weekend shifts must be positive")
-                
+            
             except ValueError as e:
                 self.show_error(f"Invalid numeric input: {str(e)}")
                 return
-        
+    
             # Parse holidays - also using DD-MM-YYYY format
             holidays_list = []
             if self.holidays.text.strip():
@@ -296,71 +331,149 @@ class SetupScreen(Screen):
                     except ValueError:
                         self.show_error(f"Formato de fecha no válido: {holiday_str}\nUse DD-MM-YYYY format")
                         return
-        
+    
+            # Parse variable shifts data
+            variable_shifts = []
+            for row_data in self.variable_shift_rows:
+                start_str = row_data['start_date'].text.strip()
+                end_str = row_data['end_date'].text.strip()
+                shifts_str = row_data['shifts'].text.strip()
+            
+                # Skip empty rows
+                if not start_str and not end_str and not shifts_str:
+                    continue
+            
+                # If any field is filled, all must be filled
+                if not (start_str and end_str and shifts_str):
+                    self.show_error("For variable shifts, all fields (start date, end date, and shifts) must be filled")
+                    return
+            
+                try:
+                    range_start = datetime.strptime(start_str, "%d-%m-%Y").date()
+                    range_end = datetime.strptime(end_str, "%d-%m-%Y").date()
+                    range_shifts = int(shifts_str)
+                
+                    if range_start > range_end:
+                        self.show_error(f"Variable shifts: Start date must be before end date")
+                        return
+                
+                    if range_shifts <= 0:
+                        self.show_error(f"Variable shifts: Number of shifts must be positive")
+                        return
+                
+                    # Ensure the range is within the overall period
+                    if range_start < start_date or range_end > end_date:
+                        self.show_error(f"Variable shifts: Date range must be within the overall schedule period")
+                        return
+                
+                    variable_shifts.append({
+                        'start_date': datetime.combine(range_start, datetime.min.time()),
+                        'end_date': datetime.combine(range_end, datetime.min.time()),
+                        'shifts': range_shifts
+                    })
+                
+                except ValueError as e:
+                    self.show_error(f"Invalid data in variable shifts: {str(e)}")
+                    return
+    
+            # Check for overlapping date ranges
+            for i, range1 in enumerate(variable_shifts):
+                for j, range2 in enumerate(variable_shifts):
+                    if i != j:
+                        # Check if ranges overlap
+                        if (range1['start_date'] <= range2['end_date'] and 
+                            range1['end_date'] >= range2['start_date']):
+                            self.show_error("Variable shifts: Date ranges cannot overlap")
+                            return
+    
             # Convert date objects to datetime objects with time set to midnight
             start_datetime = datetime.combine(start_date, datetime.min.time())
             end_datetime = datetime.combine(end_date, datetime.min.time())
             holidays_datetime = [datetime.combine(holiday, datetime.min.time()) for holiday in holidays_list]
-        
+    
             # Save configuration to app
             app = App.get_running_app()
             app.schedule_config = {
-                'start_date': start_datetime,  # Now we're saving datetime objects, not date objects
-                'end_date': end_datetime,      # Now we're saving datetime objects, not date objects
+                'start_date': start_datetime,
+                'end_date': end_datetime,
                 'num_workers': num_workers,
                 'num_shifts': num_shifts,
                 'gap_between_shifts': gap_between_shifts,
                 'max_consecutive_weekends': max_consecutive_weekends,
-                'holidays': holidays_datetime,  # Now we're saving datetime objects, not date objects
+                'holidays': holidays_datetime,
                 'workers_data': [],
                 'schedule': {},
-                'current_worker_index': 0
-            }
-        
-            # Notify user
-            self.show_message('Introduce los datos de los médicos')
+                'current_worker_index': 0,
+                'variable_shifts': variable_shifts  # Make sure this line is present
+}
     
+            # Notify user
+            self.show_message('Introduce los datos de cada médico')
+
         except Exception as e:
             self.show_error(f"Error saving configuration: {str(e)}")
 
     def load_config(self, instance):
         try:
             app = App.get_running_app()
-        
+    
             # Set input fields from configuration
             if hasattr(app, 'schedule_config') and app.schedule_config:
                 if 'start_date' in app.schedule_config:
                     self.start_date.text = app.schedule_config['start_date'].strftime("%d-%m-%Y")
-            
+        
                 if 'end_date' in app.schedule_config:
                     self.end_date.text = app.schedule_config['end_date'].strftime("%d-%m-%Y")
-                
+            
                 if 'num_workers' in app.schedule_config:
                     self.num_workers.text = str(app.schedule_config['num_workers'])
-                
+            
                 if 'num_shifts' in app.schedule_config:
                     self.num_shifts.text = str(app.schedule_config['num_shifts'])
-                
+            
                 # Load new settings if they exist, otherwise use defaults
                 if 'gap_between_shifts' in app.schedule_config:
                     self.gap_between_shifts.text = str(app.schedule_config['gap_between_shifts'])
                 else:
-                    self.gap_between_shifts.text = "1"  # Default value
-                
+                    self.gap_between_shifts.text = "3"  
+            
                 if 'max_consecutive_weekends' in app.schedule_config:
                     self.max_consecutive_weekends.text = str(app.schedule_config['max_consecutive_weekends'])
                 else:
-                    self.max_consecutive_weekends.text = "2"  # Default value
-                
+                    self.max_consecutive_weekends.text = "3"  
+            
                 if 'holidays' in app.schedule_config and app.schedule_config['holidays']:
                     # Format holidays in DD-MM-YYYY format
                     holidays_str = ", ".join([d.strftime("%d-%m-%Y") for d in app.schedule_config['holidays']])
                     self.holidays.text = holidays_str
+            
+                # Load variable shifts
+                if 'variable_shifts' in app.schedule_config and app.schedule_config['variable_shifts']:
+                    # Clear existing rows
+                    for row_data in list(self.variable_shift_rows):
+                        self.variable_shifts_container.remove_widget(row_data['row'])
+                    self.variable_shift_rows = []
                 
+                    # Add rows for each saved variable shift
+                    for shift_range in app.schedule_config['variable_shifts']:
+                        self.add_variable_shift_row()
+                        row_data = self.variable_shift_rows[-1]  # Get the last added row
+                    
+                        # Fill in the data
+                        start_date = shift_range['start_date']
+                        end_date = shift_range['end_date']
+                        shifts = shift_range['shifts']
+                    
+                        row_data['start_date'].text = start_date.strftime("%d-%m-%Y")
+                        row_data['end_date'].text = end_date.strftime("%d-%m-%Y")
+                        row_data['shifts'].text = str(shifts)
+            
                 self.show_message('Configuration loaded successfully')
             else:
                 self.show_message('No saved configuration found')
-                
+            
+        except Exception as e:
+            self.show_error(f"Error loading configuration: {str(e)}")            
         except Exception as e:
             self.show_error(f"Error loading configuration: {str(e)}")
     
@@ -385,6 +498,65 @@ class SetupScreen(Screen):
                      content=Label(text=message),
                      size_hint=(None, None), size=(400, 200))
         popup.open()
+
+    def add_variable_shift_row(self, instance=None):
+        """Add a new row for defining variable shifts for a date range"""
+        row = BoxLayout(orientation='horizontal', size_hint_y=None, height=60, spacing=5)
+    
+        # Start date for this range
+        start_range = BoxLayout(orientation='vertical', size_hint_x=0.3)
+        start_range.add_widget(Label(text='Desde (DD-MM-YYYY):', size_hint_y=0.3, halign='left'))
+        start_date_input = TextInput(multiline=False, size_hint_y=0.7)
+        start_range.add_widget(start_date_input)
+    
+        # End date for this range
+        end_range = BoxLayout(orientation='vertical', size_hint_x=0.3)
+        end_range.add_widget(Label(text='Hasta (DD-MM-YYYY):', size_hint_y=0.3, halign='left'))
+        end_date_input = TextInput(multiline=False, size_hint_y=0.7)
+        end_range.add_widget(end_date_input)
+    
+        # Number of shifts for this range
+        shifts_range = BoxLayout(orientation='vertical', size_hint_x=0.2)
+        shifts_range.add_widget(Label(text='Guardias/día:', size_hint_y=0.3, halign='left'))
+        shifts_input = TextInput(multiline=False, input_filter='int', size_hint_y=0.7)
+        shifts_range.add_widget(shifts_input)
+    
+        # Remove button
+        remove_btn = Button(text='X', size_hint_x=0.1)
+        remove_btn.row = row  # Store reference to the row for removal
+        remove_btn.bind(on_press=self.remove_variable_shift_row)
+    
+        row.add_widget(start_range)
+        row.add_widget(end_range)
+        row.add_widget(shifts_range)
+        row.add_widget(remove_btn)
+    
+        # Store the inputs for later retrieval
+        row_data = {
+            'row': row,
+            'start_date': start_date_input,
+            'end_date': end_date_input,
+            'shifts': shifts_input,
+            'remove_btn': remove_btn
+        }
+        self.variable_shift_rows.append(row_data)
+    
+        self.variable_shifts_container.add_widget(row)
+        self.variable_shifts_container.height = len(self.variable_shift_rows) * 65  # Update container height
+
+    def remove_variable_shift_row(self, instance):
+        """Remove a variable shift row"""
+        row = instance.row
+        # Find the row data entry
+        row_data = next((data for data in self.variable_shift_rows if data['row'] == row), None)
+    
+        if row_data:
+            # Remove the row from the container
+            self.variable_shifts_container.remove_widget(row)
+            # Remove the row data from our tracking list
+            self.variable_shift_rows.remove(row_data)
+            # Update container height
+            self.variable_shifts_container.height = len(self.variable_shift_rows) * 65
 
     def parse_holidays(self, holidays_str):
         """Parse and validate holiday dates"""
@@ -756,39 +928,85 @@ class WorkerDetailsScreen(Screen):
     def generate_schedule(self):
         app = App.get_running_app()
         try:
-            print("DEBUG: generate_schedule - Starting schedule generation...") # <<< ADD
+            print("DEBUG: generate_schedule - Starting schedule generation...")
             scheduler = Scheduler(app.schedule_config)
-            success = scheduler.generate_schedule()  # This returns True/False
+            success = scheduler.generate_schedule()
 
-            if not success:  # Schedule generation failed
+            if not success:
                 raise ValueError("Failed to generate schedule - validation errors detected")
 
-            # Get the actual schedule from the scheduler object
             schedule = scheduler.schedule
-
-            if not schedule:  # Schedule is empty
+            if not schedule:
                 raise ValueError("Generated schedule is empty")
 
             app.schedule_config['schedule'] = schedule
-            print("DEBUG: generate_schedule - Schedule generated and saved to config.") # <<< ADD
+            print("DEBUG: generate_schedule - Schedule generated and saved to config.")
+
+            # *** NEW: Automatically export PDF summary after successful generation ***
+            try:
+                calendar_screen = self.manager.get_screen('calendar_view')
+                calendar_screen._auto_export_schedule_summary(scheduler, app.schedule_config)
+            except Exception as export_error:
+                logging.warning(f"Auto PDF export failed, but schedule was generated successfully: {export_error}")
+                # Don't fail the whole operation if PDF export fails
 
             popup = Popup(title='Success',
                          content=Label(text='Schedule generated successfully!'),
                          size_hint=(None, None), size=(400, 200))
             popup.open()
-            print("DEBUG: generate_schedule - Success popup opened.") # <<< ADD
+            print("DEBUG: generate_schedule - Success popup opened.")
 
-            # --- Transition Point ---
-            print("DEBUG: generate_schedule - Preparing to switch to calendar_view...") # <<< ADD
+            print("DEBUG: generate_schedule - Preparing to switch to calendar_view...")
             self.manager.current = 'calendar_view'
-            print("DEBUG: generate_schedule - Switched manager.current to calendar_view.") # <<< ADD
-            # --- End Transition Point ---
+            print("DEBUG: generate_schedule - Switched manager.current to calendar_view.")
 
         except Exception as e:
             error_message = f"Failed to generate schedule: {str(e)}"
-            print(f"DEBUG: generate_schedule - ERROR: {error_message}") # <<< ADD ERROR PRINT
-            logging.error(error_message, exc_info=True) # Keep logging
+            print(f"DEBUG: generate_schedule - ERROR: {error_message}")
+            logging.error(error_message, exc_info=True)
             self.show_error(error_message)
+
+    def generate_schedule_async(self):
+        """Generate schedule in a separate thread to prevent UI freezing"""
+        import threading
+        from kivy.clock import Clock
+        
+        def run_generation():
+            try:
+                app = App.get_running_app()
+                cfg = app.schedule_config
+                
+                scheduler = Scheduler(cfg)
+                success = scheduler.generate_schedule()
+                
+                if success:
+                    app.schedule_config['schedule'] = scheduler.schedule
+                    # Schedule the PDF export on the main thread
+                    Clock.schedule_once(lambda dt: self._handle_success(scheduler, cfg))
+                else:
+                    Clock.schedule_once(lambda dt: self.show_error("No se pudo generar un horario válido."))
+                    
+            except Exception as e:
+                Clock.schedule_once(lambda dt: self.show_error(f"Error: {str(e)}"))
+        
+        # Start generation in background thread
+        thread = threading.Thread(target=run_generation)
+        thread.daemon = True
+        thread.start()
+    
+    def _handle_success(self, scheduler, config):
+        """Handle successful schedule generation on main thread"""
+        try:
+            calendar_screen = self.manager.get_screen('calendar_view')
+            calendar_screen._auto_export_schedule_summary(scheduler, config)
+        except Exception as export_error:
+            logging.warning(f"Auto PDF export failed: {export_error}")
+        
+        popup = Popup(title='Success',
+                     content=Label(text='Schedule generated successfully!'),
+                     size_hint=(None, None), size=(400, 200))
+        popup.open()
+        self.manager.current = 'calendar_view'
         
     def clear_inputs(self):
         self.worker_id.text = ''
@@ -932,7 +1150,7 @@ class CalendarViewScreen(Screen):
                     }
                 stats[worker]['total_shifts'] += 1
             
-                if date.weekday() >= 5:
+                if date.weekday() >= 4:
                     stats[worker]['weekends'] += 1
                 
                 app = App.get_running_app()
@@ -983,7 +1201,7 @@ class CalendarViewScreen(Screen):
             
     def get_day_color(self, current_date):
         app = App.get_running_app()
-        is_weekend = current_date.weekday() >= 5
+        is_weekend = current_date.weekday() >= 4
         is_holiday = current_date in app.schedule_config.get('holidays', [])
         is_today = current_date.date() == datetime.now().date()
     
@@ -1048,12 +1266,22 @@ class CalendarViewScreen(Screen):
         # Add empty cells for days before the first of the month
         for _ in range(first_weekday):
             empty_cell = Label(text='')
+            # Add white background to empty cells
+            with empty_cell.canvas.before:
+                Color(1, 1, 1, 1)  # White color (RGBA)
+                Rectangle(pos=empty_cell.pos, size=empty_cell.size)
+                # Add a light gray border
+                Color(0.9, 0.9, 0.9, 1)  # Light gray border
+                Line(rectangle=(empty_cell.x, empty_cell.y, empty_cell.width, empty_cell.height))
+        
+            # Bind position and size to ensure the background follows the cell
+            empty_cell.bind(pos=self.update_rect, size=self.update_rect)
             self.calendar_grid.add_widget(empty_cell)
-    
+
         # Add days of the month
         for day in range(1, days_in_month + 1):
             current = datetime(date.year, date.month, day)
-        
+    
             # Create a BoxLayout for the cell with vertical orientation
             cell = BoxLayout(
                 orientation='vertical',
@@ -1063,28 +1291,43 @@ class CalendarViewScreen(Screen):
                 height=120  # Increase cell height
             )
 
-            # Set background color
-            bg_color = self.get_day_color(current)
+            # Set background color - Always start with white, then modify for special days
+            # First set default to white
+            bg_color = (1, 1, 1, 1)  # White
+
+            # Then check if it's a special day and adjust color
+            app = App.get_running_app()
+            is_weekend = current.weekday() >= 5
+            is_holiday = current in app.schedule_config.get('holidays', [])
+            is_today = current.date() == datetime.now().date()
+    
+            if is_today:
+                bg_color = (0.85, 0.91, 0.98, 1)  # Light blue for today, more solid
+            elif is_holiday:
+                bg_color = (1, 0.92, 0.92, 1)  # Light red for holidays, more solid
+            elif is_weekend:
+                bg_color = (1, 0.96, 0.96, 1)  # Very light red for weekends, more solid
+        
+            # Apply the background color
             with cell.canvas.before:
                 Color(*bg_color)
-                Rectangle(pos=cell.pos, size=cell.size)
+                rect = Rectangle(pos=cell.pos, size=cell.size)
             
                 # Add border
                 Color(0.7, 0.7, 0.7, 1)  # Gray border
                 Line(rectangle=(cell.x, cell.y, cell.width, cell.height))
+        
+            # Bind position and size to ensure rectangle follows cell
+            cell.rect = rect
+            cell.bind(pos=self.update_rect, size=self.update_rect)
 
             # Day number with special formatting for weekends/holidays
-            app = App.get_running_app()
-            is_weekend = current.weekday() >= 5
-            is_holiday = current in app.schedule_config.get('holidays', [])
-        
-            # Create header box for day number
             header_box = BoxLayout(
                 orientation='horizontal',
                 size_hint_y=None,
                 height=20
             )
-        
+    
             day_label = Label(
                 text=str(day),
                 bold=True,
@@ -1092,7 +1335,7 @@ class CalendarViewScreen(Screen):
                 size_hint_x=0.3
             )
             header_box.add_widget(day_label)
-        
+    
             # Add shift count if there are workers
             if current in self.schedule:
                 shift_count = len(self.schedule[current])
@@ -1104,9 +1347,9 @@ class CalendarViewScreen(Screen):
                     halign='right'
                 )
                 header_box.add_widget(count_label)
-        
+    
             cell.add_widget(header_box)
-        
+    
             # Add worker information
             if current in self.schedule:
                 workers = self.schedule[current]
@@ -1115,7 +1358,7 @@ class CalendarViewScreen(Screen):
                     padding=[5, 2],
                     spacing=2
                 )
-            
+        
                 for i, worker_id in enumerate(workers):
                     worker_label = Label(
                         text=f'S{i+1}: {worker_id}',
@@ -1128,26 +1371,36 @@ class CalendarViewScreen(Screen):
                     )
                     worker_label.bind(size=worker_label.setter('text_size'))
                     content_box.add_widget(worker_label)
-            
+        
                 cell.add_widget(content_box)
-            
+        
                 # Make the cell clickable
                 btn = Button(
-                    background_color=(0.95, 0.95, 0.95, 0.3),
+                    background_color=(0, 0, 0, 0),  # Transparent background
                     background_normal=''
                 )
                 btn.bind(on_press=lambda x, d=current: self.show_details(d))
                 cell.bind(size=btn.setter('size'), pos=btn.setter('pos'))
-            
+        
                 # Add the button at the beginning of the cell's widgets
                 cell.add_widget(btn)
-            
+        
             self.calendar_grid.add_widget(cell)
-    
+
         # Fill remaining cells
         remaining_cells = 42 - (first_weekday + days_in_month)  # 42 = 6 rows * 7 days
         for _ in range(remaining_cells):
             empty_cell = Label(text='')
+            # Add white background to empty cells
+            with empty_cell.canvas.before:
+                Color(1, 1, 1, 1)  # White color
+                Rectangle(pos=empty_cell.pos, size=empty_cell.size)
+                # Add a light gray border
+                Color(0.9, 0.9, 0.9, 1)  # Light gray border
+                Line(rectangle=(empty_cell.x, empty_cell.y, empty_cell.width, empty_cell.height))
+        
+            # Bind position and size to ensure the background follows the cell
+            empty_cell.bind(pos=self.update_rect, size=self.update_rect)
             self.calendar_grid.add_widget(empty_cell)
 
         # Update the calendar grid's properties
@@ -1155,6 +1408,13 @@ class CalendarViewScreen(Screen):
         self.calendar_grid.cols = 7  # Fixed number of columns
         self.calendar_grid.spacing = [2, 2]  # Add spacing between cells
         self.calendar_grid.padding = [5, 5]  # Add padding around the grid
+
+    # Add this helper method to your CalendarViewScreen class
+    def update_rect(self, instance, value):
+        """Update the rectangle position and size when the cell changes."""
+        if hasattr(instance, 'rect'):
+            instance.rect.pos = instance.pos
+            instance.rect.size = instance.size
 
     def show_details(self, date):
         self.details_layout.clear_widgets()
@@ -1169,7 +1429,7 @@ class CalendarViewScreen(Screen):
             self.details_layout.add_widget(header)
         
             app = App.get_running_app()
-            is_weekend = date.weekday() >= 5
+            is_weekend = date.weekday() >= 4
             is_holiday = date in app.schedule_config.get('holidays', [])
         
             # Show if it's a weekend or holiday
@@ -1259,8 +1519,6 @@ class CalendarViewScreen(Screen):
                          content=Label(text=f'Failed to export: {str(e)}'),
                          size_hint=(None, None), size=(400, 200))
             popup.open()
-
-    # Fix for the CalendarViewScreen Summary button
 
     def show_summary(self):
         """
@@ -1388,7 +1646,7 @@ class CalendarViewScreen(Screen):
             # Filter for the current month being viewed
             if date.year == self.current_date.year and date.month == self.current_date.month:
                 month_stats['total_shifts'] += len(workers)
-                is_weekend = date.weekday() >= 5
+                is_weekend = date.weekday() >= 4
                 is_holiday = date in holidays
 
                 for i, worker_id in enumerate(workers):
@@ -1475,7 +1733,7 @@ class CalendarViewScreen(Screen):
         for date, workers in schedule.items():
             # No date filtering needed here for global summary
             global_stats['total_shifts'] += len(workers)
-            is_weekend = date.weekday() >= 5
+            is_weekend = date.weekday() >= 4
             is_holiday = date in holidays
 
             for i, worker_id in enumerate(workers):
@@ -1523,12 +1781,17 @@ class CalendarViewScreen(Screen):
         Display the detailed summary dialog (handles global stats).
         """
         print("DEBUG: display_summary_dialog called.")
-        # --- ALL THE FOLLOWING CODE MUST BE INDENTED INSIDE THIS METHOD ---
+    
+        # Create the main content box
         content = BoxLayout(orientation='vertical', padding=10, spacing=10)
+    
+        # Create a proper ScrollView that takes most of the popup height
         scroll = ScrollView(size_hint=(1, 0.8))
+    
+        # Create the layout for the summary content that will be scrollable
         summary_layout = GridLayout(cols=1, spacing=10, size_hint_y=None, padding=[10, 10])
         summary_layout.bind(minimum_height=summary_layout.setter('height'))
-
+    
         # --- Modify Title ---
         start = stats_data.get('period_start')
         end = stats_data.get('period_end')
@@ -1537,27 +1800,29 @@ class CalendarViewScreen(Screen):
             title_text = f"Schedule Summary ({period_str})"
         else:
             title_text = "Schedule Summary (Full Period)"
-
+    
         summary_title = Label(text=title_text, size_hint_y=None, height=40, bold=True)
         summary_layout.add_widget(summary_title)
-
+    
         # --- Worker Details Header ---
         worker_header = Label(text="Worker Details:", size_hint_y=None, height=40, bold=True)
         summary_layout.add_widget(worker_header)
-
+    
         # --- Loop Through Workers ---
         print("DEBUG: display_summary_dialog - Adding worker details...")
         weekdays_short = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
         workers_stats = stats_data.get('workers', {})
         worker_shifts_all = stats_data.get('worker_shifts', {})
-
+    
         if not workers_stats:
-             # Add a message if there are no workers/stats
-             summary_layout.add_widget(Label(text="No worker statistics found for this period.", size_hint_y=None, height=30))
+            # Add a message if there are no workers/stats
+            summary_layout.add_widget(Label(text="No worker statistics found for this period.", size_hint_y=None, height=30))
         else:
             for worker_id, stats in sorted(stats_data['workers'].items(), key=numeric_sort_key):
                 print(f"DEBUG: display_summary_dialog - Processing worker: {worker_id}")
                 worker_box = BoxLayout(orientation='vertical', size_hint_y=None, padding=[5, 10], spacing=3)
+                worker_box.bind(minimum_height=worker_box.setter('height'))  # Ensure proper height calculation
+            
                 # Get calculated stats for this worker
                 total_w = stats.get('total', 0)
                 weekends_w = stats.get('weekends', 0)
@@ -1566,115 +1831,167 @@ class CalendarViewScreen(Screen):
                 weekday_counts = stats.get('weekday_counts', {})
                 post_counts = stats.get('post_counts', {})
                 worker_shifts = worker_shifts_all.get(worker_id, [])
-
+            
                 # --- Worker Summary Line ---
                 summary_text = f"Worker {worker_id}: Total: {total_w} | Weekends: {weekends_w} | Holidays: {holidays_w} | Last Post: {last_post_w}"
-                worker_box.add_widget(Label(
-                    text=summary_text, size_hint_y=None, height=25, bold=True, halign='left',
-                    text_size=(summary_layout.width - 30, None)
-                ))
-
+                summary_label = Label(
+                    text=summary_text, 
+                    size_hint_y=None, 
+                    height=25, 
+                    bold=True, 
+                    halign='left'
+                )
+                summary_label.bind(size=summary_label.setter('text_size'))  # Ensure text wrapping
+                worker_box.add_widget(summary_label)
+            
                 # --- Weekday Distribution Line ---
                 weekdays_str = "Weekdays: " + " ".join([f"{weekdays_short[i]}:{weekday_counts.get(i, 0)}" for i in range(7)])
-                worker_box.add_widget(Label(
-                    text=weekdays_str, size_hint_y=None, height=25, halign='left',
-                    text_size=(summary_layout.width - 30, None)
-                ))
-
+                weekday_label = Label(
+                    text=weekdays_str, 
+                    size_hint_y=None, 
+                    height=25, 
+                    halign='left'
+                )
+                weekday_label.bind(size=weekday_label.setter('text_size'))  # Ensure text wrapping
+                worker_box.add_widget(weekday_label)
+            
                 # --- Post Distribution Line ---
                 posts_str = "Posts: " + " ".join([f"P{post+1}:{count}" for post, count in sorted(post_counts.items())])
-                worker_box.add_widget(Label(
-                    text=posts_str, size_hint_y=None, height=25, halign='left',
-                    text_size=(summary_layout.width - 30, None)
-                ))
-
+                posts_label = Label(
+                    text=posts_str, 
+                    size_hint_y=None, 
+                    height=25, 
+                    halign='left'
+                )
+                posts_label.bind(size=posts_label.setter('text_size'))  # Ensure text wrapping
+                worker_box.add_widget(posts_label)
+            
                 # --- Assigned Shifts Header ---
-                worker_box.add_widget(Label(
-                    text="Assigned Shifts:", size_hint_y=None, height=25, halign='left', bold=True
-                ))
-
+                shifts_header = Label(
+                    text="Assigned Shifts:", 
+                    size_hint_y=None, 
+                    height=25, 
+                    halign='left', 
+                    bold=True
+                )
+                shifts_header.bind(size=shifts_header.setter('text_size'))  # Ensure text wrapping
+                worker_box.add_widget(shifts_header)
+            
                 # --- List of Shifts ---
+                shifts_container = GridLayout(cols=1, size_hint_y=None, spacing=2)
+                shifts_container.bind(minimum_height=shifts_container.setter('height'))  # Important for scrolling
+            
                 if not worker_shifts:
-                     worker_box.add_widget(Label(text="  (No shifts assigned)", size_hint_y=None, height=20, halign='left'))
-                for shift in sorted(worker_shifts, key=lambda x: x['date']):
-                    date_str = shift['date'].strftime('%d-%m-%Y')
-                    post_str = f"Post {shift['post']}"
-                    day_type = ""
-                    if shift['is_holiday']: day_type = " [HOLIDAY]"
-                    elif shift['is_weekend']: day_type = " [WEEKEND]"
-
-                    shift_text = f" • {date_str} ({shift['day'][:3]}){day_type}: {post_str}"
-                    shift_label = Label(
-                        text=shift_text, size_hint_y=None, height=20, halign='left',
-                        text_size=(summary_layout.width - 40, None)
+                    no_shifts_label = Label(
+                        text="  (No shifts assigned)", 
+                        size_hint_y=None, 
+                        height=20, 
+                        halign='left'
                     )
-                    worker_box.add_widget(shift_label)
-
+                    no_shifts_label.bind(size=no_shifts_label.setter('text_size'))
+                    shifts_container.add_widget(no_shifts_label)
+                else:
+                    for shift in sorted(worker_shifts, key=lambda x: x['date']):
+                        date_str = shift['date'].strftime('%d-%m-%Y')
+                        post_str = f"Post {shift['post']}"
+                        day_type = ""
+                        if shift['is_holiday']: 
+                            day_type = " [HOLIDAY]"
+                        elif shift['is_weekend']: 
+                            day_type = " [WEEKEND]"
+                    
+                        shift_text = f" • {date_str} ({shift['day'][:3]}){day_type}: {post_str}"
+                        shift_label = Label(
+                            text=shift_text, 
+                            size_hint_y=None, 
+                            height=20, 
+                            halign='left'
+                        )
+                        shift_label.bind(size=shift_label.setter('text_size'))
+                        shifts_container.add_widget(shift_label)
+            
+                # Add the shifts container to the worker box
+                shifts_container.height = max(20, len(worker_shifts) * 20)  # Set appropriate height
+                worker_box.add_widget(shifts_container)
+            
                 # --- Calculate Height Dynamically ---
-                base_height = 25 * 4 + 20
-                shifts_height = max(20, len(worker_shifts) * 20)
-                worker_box.height = base_height + shifts_height
-                # print(f"DEBUG: display_summary_dialog - Worker {worker_id} Box height: {worker_box.height}") # Optional Debug
-
+                base_height = 25 * 4  # Summary + Weekday + Posts + Shifts Header
+                total_height = base_height + shifts_container.height + 20  # Add some padding
+                worker_box.height = total_height
+            
                 # --- Separator ---
                 separator = BoxLayout(size_hint_y=None, height=1)
                 with separator.canvas:
                     from kivy.graphics import Color, Rectangle
                     Color(0.7, 0.7, 0.7, 1)
                     Rectangle(pos=separator.pos, size=separator.size)
-
+            
+                # Add the worker box and separator to the summary layout
                 summary_layout.add_widget(worker_box)
                 summary_layout.add_widget(separator)
-                # --- End Worker Loop ---
-
-        print("DEBUG: display_summary_dialog - Finished adding worker details.")
+    
+        # Set the height of the summary layout to ensure scrolling works
+        # This is critical - we need to ensure this layout takes appropriate space
+        summary_layout.height = summary_layout.minimum_height
+    
+        # Add the summary layout to the scroll view
         scroll.add_widget(summary_layout)
+    
+        # Add the scroll view to the main content
         content.add_widget(scroll)
-
+    
         # --- Buttons (Export PDF, Close) ---
         button_layout = BoxLayout(orientation='horizontal', size_hint_y=0.1, spacing=10)
-        # DEFINE buttons here, inside the method
         pdf_button = Button(text='Export PDF')
         close_button = Button(text='Close')
         button_layout.add_widget(pdf_button)
         button_layout.add_widget(close_button)
         content.add_widget(button_layout)
-
+    
         # --- Popup Creation ---
         popup = Popup(
-            title='Schedule Summary', content=content, size_hint=(0.9, 0.9), auto_dismiss=False
+            title='Schedule Summary', 
+            content=content, 
+            size_hint=(0.9, 0.9), 
+            auto_dismiss=False
         )
-        
+    
+        # Button callbacks
         def on_pdf(instance):
             print("DEBUG: on_pdf callback triggered!")
             try:
                 print("DEBUG: Calling export_summary_pdf from on_pdf...")
-                # Pass the comprehensive month_stats
                 self.export_summary_pdf(stats_data)
                 print("DEBUG: export_summary_pdf call finished.")
             except Exception as e:
                 print(f"DEBUG: Error calling export_summary_pdf from on_pdf: {e}")
                 logging.error(f"Error during PDF export triggered from popup: {e}", exc_info=True)
-                # Show error popup
-                error_popup = Popup(title='PDF Export Error', content=Label(text=f'Failed export: {e}'),
-                                    size_hint=(None, None), size=(400,200))
+                error_popup = Popup(
+                    title='PDF Export Error', 
+                    content=Label(text=f'Failed export: {e}'),
+                    size_hint=(None, None), 
+                    size=(400, 200)
+                )
                 error_popup.open()
             finally:
-                 popup.dismiss()
-                 print("DEBUG: Popup dismissed from on_pdf")
-
+                popup.dismiss()
+                print("DEBUG: Popup dismissed from on_pdf")
+    
         def on_close(instance):
             print("DEBUG: on_close callback triggered!")
             popup.dismiss()
             print("DEBUG: Popup dismissed from on_close")
-
+    
         pdf_button.bind(on_press=on_pdf)
         close_button.bind(on_press=on_close)
-
-        # --- Show Popup ---
+    
+        # Show the popup
         print("DEBUG: Opening summary popup...")
         popup.open()
         print("DEBUG: Summary popup should be open.")
+    
+        # Return True to indicate success (for compatibility with existing code)
+        return True
         
     def show_global_summary(self, instance):
         """Calculate and display a summary of the ENTIRE schedule period."""
@@ -1833,6 +2150,126 @@ class CalendarViewScreen(Screen):
             )
             popup.open()
 
+    def _auto_export_schedule_summary(self, scheduler, config):
+        """Automatically export PDF summary after schedule generation"""
+        from pdf_exporter import PDFExporter
+        from datetime import datetime
+        import os
+        import subprocess
+        import platform
+        
+        try:
+            # Create PDF exporter with the generated schedule
+            schedule_config_for_export = {
+                'schedule': scheduler.schedule,
+                'workers_data': config.get('workers_data', []),
+                'num_shifts': config.get('num_shifts', 0),
+                'holidays': config.get('holidays', [])
+            }
+            
+            pdf_exporter = PDFExporter(schedule_config_for_export)
+            
+            # Generate statistics for the PDF
+            stats_data = self._generate_stats_for_export(scheduler, config)
+            
+            # Export the PDF
+            filename = pdf_exporter.export_summary_pdf(stats_data)
+            
+            if filename and os.path.exists(filename):
+                logging.info(f"Schedule summary automatically exported to: {filename}")
+                
+                # Automatically open the PDF
+                self._open_pdf_file(filename)
+                
+                # Show success popup
+                from kivy.uix.popup import Popup
+                from kivy.uix.label import Label
+                popup = Popup(
+                    title='Schedule Generated & Exported', 
+                    content=Label(text=f'Schedule generated successfully!\nPDF exported to: {filename}\nFile opened automatically.'),
+                    size_hint=(None, None), 
+                    size=(500, 250)
+                )
+                popup.open()
+                
+        except Exception as e:
+            logging.error(f"Auto export failed: {e}")
+            raise e
+
+    def _generate_stats_for_export(self, scheduler, config):
+        """Generate statistics data for PDF export"""
+        from datetime import datetime
+        
+        workers_stats = {}
+        worker_shifts_all = {}
+        
+        for worker in config.get('workers_data', []):
+            worker_id = worker['id']
+            assignments = scheduler.worker_assignments.get(worker_id, set())
+            
+            # Basic stats calculation
+            total_shifts = len(assignments)
+            weekend_shifts = sum(1 for date in assignments if date.weekday() >= 4)
+            holiday_shifts = sum(1 for date in assignments if date in config.get('holidays', []))
+            
+            # Post distribution
+            post_counts = {}
+            weekday_counts = {i: 0 for i in range(7)}
+            
+            shifts_list = []
+            for date in assignments:
+                if date in scheduler.schedule:
+                    try:
+                        post = scheduler.schedule[date].index(worker_id)
+                        post_counts[post] = post_counts.get(post, 0) + 1
+                        
+                        shifts_list.append({
+                            'date': date,
+                            'day': date.strftime('%A'),
+                            'post': post + 1,
+                            'is_weekend': date.weekday() >= 4,
+                            'is_holiday': date in config.get('holidays', [])
+                        })
+                    except ValueError:
+                        pass
+                
+                weekday_counts[date.weekday()] += 1
+            
+            workers_stats[worker_id] = {
+                'total': total_shifts,
+                'weekends': weekend_shifts,
+                'holidays': holiday_shifts,
+                'last_post': post_counts.get(config.get('num_shifts', 1) - 1, 0),
+                'weekday_counts': weekday_counts,
+                'post_counts': post_counts
+            }
+            
+            worker_shifts_all[worker_id] = shifts_list
+        
+        return {
+            'period_start': config.get('start_date', datetime.now()),
+            'period_end': config.get('end_date', datetime.now()),
+            'workers': workers_stats,
+            'worker_shifts': worker_shifts_all
+        }
+
+    def _open_pdf_file(self, filename):
+        """Automatically open the generated PDF file"""
+        try:
+            import os
+            import subprocess
+            import platform
+            
+            if platform.system() == 'Windows':
+                os.startfile(filename)
+            elif platform.system() == 'Darwin':  # macOS
+                subprocess.run(['open', filename])
+            else:  # Linux
+                subprocess.run(['xdg-open', filename])
+                
+        except Exception as e:
+            logging.warning(f"Could not auto-open PDF file: {e}")
+
     def confirm_reset_schedule(self, instance):
         """Show confirmation dialog before resetting schedule"""
         content = BoxLayout(orientation='vertical', padding=10, spacing=10)
@@ -1877,43 +2314,36 @@ class CalendarViewScreen(Screen):
         popup.open()
 
     def reset_schedule(self, popup):
-        """Reset the schedule and return to setup screen"""
+        """Reset the schedule but keep worker data and return to worker details screen"""
         try:
             app = App.get_running_app()
+    
+            # Keep ALL current settings including worker data
+            current_config = app.schedule_config.copy()
+    
+            # Only clear the generated schedule, keep everything else
+            current_config['schedule'] = {}
+            current_config['current_worker_index'] = 0
         
-            # Keep some basic settings from the current configuration
-            basic_settings = {
-                'start_date': app.schedule_config.get('start_date'),
-                'end_date': app.schedule_config.get('end_date'),
-                'holidays': app.schedule_config.get('holidays', []),
-                'num_workers': app.schedule_config.get('num_workers', 0),
-                'num_shifts': app.schedule_config.get('num_shifts', 0)
-            }
-        
-            # Reset config to just the basic settings
-            app.schedule_config = basic_settings
-        
-            # Clear out the workers_data and schedule
-            app.schedule_config['workers_data'] = []
-            app.schedule_config['schedule'] = {}
-            app.schedule_config['current_worker_index'] = 0
-        
+            # Update the app config
+            app.schedule_config = current_config
+    
             # Dismiss the popup
             popup.dismiss()
-        
+    
             # Show success message
             success = Popup(
                 title='Success',
-                content=Label(text='Schedule has been reset.\nReturning to worker details...'),
+                content=Label(text='Schedule has been reset.\nWorker data preserved.\nReturning to worker details...'),
                 size_hint=(None, None),
                 size=(400, 200)
             )
             success.open()
-        
+    
             # Schedule a callback to close the popup and navigate
             from kivy.clock import Clock
             Clock.schedule_once(lambda dt: self.navigate_after_reset(success), 2)
-        
+    
         except Exception as e:
             # Show error
             error_popup = Popup(
@@ -1923,7 +2353,7 @@ class CalendarViewScreen(Screen):
                 size=(400, 200)
             )
             error_popup.open()
-        
+    
             # Dismiss the confirmation popup
             popup.dismiss()
 
@@ -1931,6 +2361,57 @@ class CalendarViewScreen(Screen):
         """Navigate to worker details after reset"""
         popup.dismiss()
         self.manager.current = 'worker_details'
+
+class GenerateScheduleScreen(Screen):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+        # A button to kick off scheduling
+        btn = Button(text="Generar horario", size_hint=(1, None), height=50)
+        btn.bind(on_press=self.on_generate)
+        self.add_widget(btn)
+
+    def on_generate(self, instance):
+        app = App.get_running_app()
+        cfg = getattr(app, "schedule_config", None)
+        if not cfg:
+            return self._error("No hay configuración de turno guardada.")
+
+        # Sanity‐check that the gap parameters exist
+        if "gap_between_shifts" not in cfg or "max_consecutive_weekends" not in cfg:
+            return self._error("Faltan parámetros 'gap_between_shifts' o 'max_consecutive_weekends'.")
+
+        # Make sure workers list is ready
+        if not cfg.get("workers_data"):
+            return self._error("No se han introducido los datos de los médicos.")
+
+        try:
+            # Pass the entire dict (with your UI‐entered gaps) into Scheduler:
+            scheduler = Scheduler(cfg)
+            success   = scheduler.generate_schedule()
+            if not success:
+                return self._error("No se pudo generar un horario válido.")
+
+            # Store for later display/review
+            app.final_schedule = scheduler.schedule
+
+            # *** NEW: Automatically export PDF summary after successful generation ***
+            try:
+                self._auto_export_schedule_summary(scheduler, cfg)
+            except Exception as export_error:
+                logging.warning(f"Auto PDF export failed, but schedule was generated successfully: {export_error}")
+                # Don't fail the whole operation if PDF export fails
+
+            # Switch to your “review” screen:
+            self.manager.current = "schedule_review"
+
+        except SchedulerError as e:
+            self._error(f"Error al generar: {e}")
+
+    def _error(self, msg):
+        p = Popup(title="Error", content=Label(text=msg),
+                  size_hint=(None, None), size=(400, 200))
+        p.open()
               
 class ShiftManagerApp(App):
     def __init__(self, **kwargs):
@@ -1955,6 +2436,11 @@ class ShiftManagerApp(App):
         # Print the default current screen
         print(f"DEBUG: Default current screen: {sm.current}") # <<< ADD THIS LINE
         return sm
+
+    def main():
+        # Initialize your Kivy app
+        app = MyApp()
+        app.run()
 
 if __name__ == '__main__':
     ShiftManagerApp().run()

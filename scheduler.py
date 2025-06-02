@@ -1,6 +1,7 @@
 # Imports
 from datetime import datetime, timedelta
 import logging
+import os
 import sys
 import random
 import copy
@@ -12,7 +13,60 @@ from statistics import StatisticsCalculator
 from exceptions import SchedulerError
 from worker_eligibility import WorkerEligibilityTracker
 
-# Class definition
+# Configure logging
+log_dir = "logs"
+if not os.path.exists(log_dir):
+    try:
+        os.makedirs(log_dir)
+        print(f"Log directory '{log_dir}' created successfully.")
+    except OSError as e:
+        print(f"Error creating log directory '{log_dir}': {e}. Logs might not be saved to file.")
+        # Fallback to current directory if 'logs' can't be made
+        log_dir = "." 
+
+log_file_path = os.path.join(log_dir, "scheduler.log")
+print(f"Logging to: {os.path.abspath(log_file_path)}")
+
+# Configure root logger
+logger = logging.getLogger()
+logger.setLevel(logging.DEBUG)
+
+# Remove any existing handlers to avoid duplicates
+for handler in logger.handlers[:]:
+    logger.removeHandler(handler)
+    handler.close()
+
+# Create and add handlers
+try:
+    # File handler - using 'a' (append) mode instead of 'w' (overwrite)
+    # Also specifying UTF-8 encoding to properly handle special characters
+    file_handler = logging.FileHandler(log_file_path, mode='a', encoding='utf-8', errors='replace')
+    file_handler.setLevel(logging.DEBUG)
+    file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
+    
+    # Console handler with UTF-8 encoding if possible
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.DEBUG)
+    console_formatter = logging.Formatter('%(levelname)s: %(message)s')
+    console_handler.setFormatter(console_formatter)
+    # Try to configure console for UTF-8
+    if hasattr(console_handler.stream, 'reconfigure'):
+        try:
+            console_handler.stream.reconfigure(encoding='utf-8', errors='replace')
+        except Exception as e:
+            print(f"Could not reconfigure console stream encoding: {e}")
+    logger.addHandler(console_handler)
+    
+    # Test log message to verify configuration
+    logging.info("Logging system configured successfully.")
+except Exception as e:
+    print(f"ERROR: Failed to configure logging: {e}")
+    # Set up a basic console logger as fallback
+    logging.basicConfig(level=logging.DEBUG, format='%(levelname)s: %(message)s')
+    logging.error(f"Failed to set up file logging. Logs will only appear in console. Error: {e}")# Define classes and methods...
+
 class SchedulerError(Exception):
     """Custom exception for Scheduler errors"""
     pass
@@ -30,12 +84,13 @@ class Scheduler:
     
             # Then validate the configuration
             self._validate_config(config)
-        
+    
             # Basic setup from config
             self.config = config
             self.start_date = config['start_date']
             self.end_date = config['end_date']
             self.num_shifts = config['num_shifts']
+            self.variable_shifts = config.get('variable_shifts', [])
             self.workers_data = config['workers_data']
             self.holidays = config.get('holidays', [])
 
@@ -54,26 +109,28 @@ class Scheduler:
                     worker['incompatible_with'] = list(incompatible_worker_ids - {worker_id}) # Exclude self
                 logging.debug(f"Worker {worker_id} incompatible_with list: {worker['incompatible_with']}")
             # --- END: Build incompatibility lists ---
-        
-            # Get the new configurable parameters with defaults
-            self.gap_between_shifts = config.get('gap_between_shifts', 1)
-            self.max_consecutive_weekends = config.get('max_consecutive_weekends', 2)
     
+            # Get the new configurable parameters with defaults
+            self.gap_between_shifts = config.get('gap_between_shifts', 3)
+            self.max_consecutive_weekends = config.get('max_consecutive_weekends', 3)
+
             # Initialize tracking dictionaries
             self.schedule = {}
             self.worker_assignments = {w['id']: set() for w in self.workers_data}
-            self.worker_posts = {w['id']: {p: 0 for p in range(self.num_shifts)} for w in self.workers_data}
+            self.worker_posts = {w['id']: set() for w in self.workers_data} # CORRECTED: Initialize as a set
             self.worker_weekdays = {w['id']: {i: 0 for i in range(7)} for w in self.workers_data}
-            self.worker_weekends = {w['id']: [] for w in self.workers_data}
-
-            # Initialize tracking data structures
+            self.worker_weekends = {w['id']: [] for w in self.workers_data} # This is a list of dates, which is fine
+            # Initialize the schedule structure with the appropriate number of shifts for each date
+            self._initialize_schedule_with_variable_shifts() 
+            # Initialize tracking data structures (These seem to be for overall counts, distinct from worker_posts which tracks *which* posts)
             self.worker_shift_counts = {w['id']: 0 for w in self.workers_data}
-            self.worker_weekend_counts = {w['id']: 0 for w in self.workers_data}
-            self.worker_post_counts = {w['id']: {p: 0 for p in range(self.num_shifts)} for w in self.workers_data}
+            self.worker_weekend_counts = {w['id']: 0 for w in self.workers_data} 
+            self.worker_post_counts = {w['id']: {p: 0 for p in range(self.num_shifts)} for w in self.workers_data} # This is for counting how many times each post is worked by a worker, distinct from self.worker_posts
             self.worker_weekday_counts = {w['id']: {d: 0 for d in range(7)} for w in self.workers_data}
             self.worker_holiday_counts = {w['id']: 0 for w in self.workers_data}
-            # Store last assignment date for gap checks
-            self.last_assignment_date = {w['id']: None for w in self.workers_data}
+            self.last_assignment_date = {w['id']: None for w in self.workers_data} # Corrected attribute name
+            # Initialize consecutive_shifts
+            self.consecutive_shifts = {w['id']: 0 for w in self.workers_data} # <<< --- ADD THIS LINE
                       
             # Initialize worker targets
             for worker in self.workers_data:
@@ -81,15 +138,16 @@ class Scheduler:
                     worker['target_shifts'] = 0
 
             # Set current time and user
-            self.date_utils = DateTimeUtils()
+            # self.date_utils = DateTimeUtils() # Already initialized above
             self.current_datetime = self.date_utils.get_spain_time()
             self.current_user = 'saldo27'
         
             # Add max_shifts_per_worker calculation
             total_days = (self.end_date - self.start_date).days + 1
-            total_shifts = total_days * self.num_shifts
+            total_shifts_possible = total_days * self.num_shifts # Renamed for clarity
             num_workers = len(self.workers_data)
-            self.max_shifts_per_worker = (total_shifts // num_workers) + 2  # Add some flexibility
+            # Ensure num_workers is not zero to prevent DivisionByZeroError
+            self.max_shifts_per_worker = (total_shifts_possible // num_workers) + 2 if num_workers > 0 else total_shifts_possible 
 
             # Track constraint skips
             self.constraint_skips = {
@@ -104,25 +162,32 @@ class Scheduler:
             self.stats = StatisticsCalculator(self)
             self.constraint_checker = ConstraintChecker(self)  
             self.data_manager = DataManager(self)
-            self.schedule_builder = ScheduleBuilder(self)
+            # self.schedule_builder will be initialized later in generate_schedule
             self.eligibility_tracker = WorkerEligibilityTracker(
                 self.workers_data,
                 self.holidays,
                 self.gap_between_shifts,
-                self.max_consecutive_weekends
+                self.max_consecutive_weekends,
+                start_date=self.start_date,  # Pass start_date
+                end_date=self.end_date,      # Pass end_date
+                date_utils=self.date_utils,  # Pass date_utils
+                scheduler=self              # Pass reference to scheduler
             )
 
+            # Sort the variable shifts by start date for efficient lookup
+            self.variable_shifts.sort(key=lambda x: x['start_date'])
+    
             # Calculate targets before proceeding
             self._calculate_target_shifts()
 
             self._log_initialization()
 
-            # Ensure ScheduleBuilder receives the updated self.workers_data
-            self.builder = ScheduleBuilder(self)
-    
+            # The ScheduleBuilder is now initialized within the generate_schedule method
+            # after the scheduler's own state for the run is fully prepared.
+            # self.schedule_builder = ScheduleBuilder(self) # This line is moved to generate_schedule
 
         except Exception as e:
-            logging.error(f"Initialization error: {str(e)}")
+            logging.error(f"Initialization error: {str(e)}", exc_info=True) # Added exc_info=True
             raise SchedulerError(f"Failed to initialize scheduler: {str(e)}")
         
     def _validate_config(self, config):
@@ -223,14 +288,71 @@ class Scheduler:
         """Reset all schedule data"""
         self.schedule = {}
         self.worker_assignments = {w['id']: set() for w in self.workers_data}
-        self.worker_posts = {w['id']: {p: 0 for p in range(self.num_shifts)} for w in self.workers_data}
+        self.worker_posts = {w['id']: set() for w in self.workers_data}
         self.worker_weekdays = {w['id']: {i: 0 for i in range(7)} for w in self.workers_data}
         self.worker_weekends = {w['id']: [] for w in self.workers_data}
         self.constraint_skips = {
             w['id']: {'gap': [], 'incompatibility': [], 'reduced_gap': []}
             for w in self.workers_data
         }
+
+    def _save_current_as_best(self):
+        """
+        Save the current schedule as the best schedule found so far.
+        """
+        try:
+            logging.debug("Saving current schedule as best...")
         
+            # Create a deep copy of the current schedule
+            best_schedule = {}
+            for date, shifts in self.schedule.items():
+                best_schedule[date] = shifts.copy()
+            
+            # Save all tracking data
+            self.best_schedule_data = {
+                'schedule': best_schedule,
+                'worker_assignments': {w_id: assignments.copy() for w_id, assignments in self.worker_assignments.items()},
+                'worker_posts': {w_id: posts.copy() for w_id, posts in self.worker_posts.items()},
+                'worker_weekdays': {w_id: counts.copy() for w_id, counts in self.worker_weekdays.items()},
+                'worker_weekends': {w_id: dates.copy() for w_id, dates in self.worker_weekends.items()},
+                'worker_shift_counts': self.worker_shift_counts.copy() if hasattr(self, 'worker_shift_counts') else None,
+                'worker_weekend_counts': self.worker_weekend_counts.copy() if hasattr(self, 'worker_weekend_counts') else None,
+                'score': self.calculate_score()
+            }
+        
+            logging.debug(f"Saved best schedule with score: {self.best_schedule_data['score']}")
+            return True
+        except Exception as e:
+            logging.error(f"Error saving best schedule: {str(e)}", exc_info=True)
+            return False
+
+    def _initialize_schedule_with_variable_shifts(self):
+        # Initialize loop variables
+        current_date = self.start_date
+        dates_initialized = 0
+        variable_dates = 0
+        # Build a lookup for fast matching of variable ranges
+        var_cfgs = [
+            (cfg['start_date'], cfg['end_date'], cfg['shifts'])
+            for cfg in self.variable_shifts
+        ]
+        while current_date <= self.end_date:
+            # Determine how many shifts this date should have
+            shifts_for_date = self.num_shifts
+            for start, end, cnt in var_cfgs:
+                if start <= current_date <= end:
+                    shifts_for_date = cnt
+                    logging.info(f"Variable shifts applied for {current_date}: {cnt} shifts (default is {self.num_shifts})")
+                    variable_dates += 1
+                    break
+            # Initialize the schedule entry for this date
+            self.schedule[current_date] = [None] * shifts_for_date
+            dates_initialized += 1
+
+            # Move to next date
+            current_date += timedelta(days=1)
+
+
     def _get_schedule_months(self):
         """
         Calculate number of months in schedule period considering partial months
@@ -261,150 +383,140 @@ class Scheduler:
     
         return month_days
 
+    def _get_shifts_for_date(self, date):
+        """Determine the number of shifts for a specific date based on variable_shifts."""
+        logging.debug(f"Checking variable shifts for date: {date}")
+        # Normalize to date-only if datetime
+        check_date = date.date() if hasattr(date, 'date') else date
+        for cfg in self.variable_shifts:
+            start = cfg.get('start_date')
+            end   = cfg.get('end_date')
+            shifts = cfg.get('shifts')
+            # Normalize
+            sd = start.date() if hasattr(start, 'date') else start
+            ed = end.date() if hasattr(end, 'date') else end
+            if sd <= check_date <= ed:
+                logging.debug(f"Variable shifts: {shifts} for {date}")
+                return shifts
+        # Fallback to default
+        logging.debug(f"No variable shift override for {date}, default={self.num_shifts}")
+        return self.num_shifts
+
     def _calculate_target_shifts(self):
         """
-        Calculate target number of shifts for each worker based on their work percentage,
-        ensuring optimal distribution and fairness while respecting mandatory shifts.
+        Recalculate each worker's target_shifts by:
+          1) Counting slots they can work (based on work_periods & days_off)
+          2) Weighting those slots by their work_percentage
+          3) Allocating all schedule slots proportionally (largest‐remainder rounding)
         """
         try:
-            logging.info("Calculating target shifts distribution...")
-            total_days = (self.end_date - self.start_date).days + 1
-            total_shifts = total_days * self.num_shifts
-        
-            # First, account for mandatory shifts which cannot be redistributed
-            mandatory_shifts_by_worker = {}
-            total_mandatory_shifts = 0
-        
-            for worker in self.workers_data:
-                worker_id = worker['id']
-                mandatory_days = worker.get('mandatory_days', [])
-                mandatory_dates = self.date_utils.parse_dates(mandatory_days)
-            
-                # Count only mandatory days within schedule period
-                valid_mandatory_dates = [d for d in mandatory_dates 
-                                        if self.start_date <= d <= self.end_date]
-            
-                mandatory_count = len(valid_mandatory_dates)
-                mandatory_shifts_by_worker[worker_id] = mandatory_count
-                total_mandatory_shifts += mandatory_count
-            
-                logging.debug(f"Worker {worker_id} has {mandatory_count} mandatory shifts")
-        
-            # Remaining shifts to distribute
-            remaining_shifts = total_shifts - total_mandatory_shifts
-            logging.info(f"Total shifts: {total_shifts}, Mandatory shifts: {total_mandatory_shifts}, Remaining: {remaining_shifts}")
-        
-            if remaining_shifts < 0:
-                logging.error("More mandatory shifts than total available shifts!")
-                remaining_shifts = 0
-        
-            # Get and validate all worker percentages
-            percentages = []
-            for worker in self.workers_data:
+            logging.info("Calculating target shifts based on availability and percentage")
+
+            # 1) Total open slots in the schedule (variable shifts considered)
+            total_slots = sum(len(slots) for slots in self.schedule.values())
+            if total_slots <= 0:
+                logging.warning("No slots in schedule; skipping allocation")
+                return False
+
+            # 2) Compute available_slots per worker
+            available_slots = {}
+            for w in self.workers_data:
+                wid = w['id']
+                wp = w.get('work_periods','').strip()
+                dp = w.get('days_off','').strip()
+                work_ranges = (self.date_utils.parse_date_ranges(wp) 
+                               if wp else [(self.start_date, self.end_date)])
+                off_ranges  = (self.date_utils.parse_date_ranges(dp) 
+                               if dp else [])
+                count = 0
+                for date, slots in self.schedule.items():
+                    in_work = any(s <= date <= e for s, e in work_ranges)
+                    in_off  = any(s <= date <= e for s, e in off_ranges)
+                    if in_work and not in_off:
+                        count += len(slots)
+                available_slots[wid] = count
+                logging.debug(f"Worker {wid}: available_slots={count}")
+
+            # 3) Build weight = available_slots * (work_percentage/100)
+            weights = []
+            for w in self.workers_data:
+                wid = w['id']
+                pct = 1.0
                 try:
-                    percentage = float(str(worker.get('work_percentage', 100)).strip())
-                    if percentage <= 0:
-                        logging.warning(f"Worker {worker['id']} has invalid percentage ({percentage}), using 100%")
-                        percentage = 100
-                    percentages.append(percentage)
-                except (ValueError, TypeError) as e:
-                    logging.warning(f"Invalid percentage for worker {worker['id']}, using 100%: {str(e)}")
-                    percentages.append(100)
-        
-            # Calculate the total percentage points available across all workers
-            total_percentage = sum(percentages)
-        
-            # First pass: Calculate exact targets based on percentages for remaining shifts
-            exact_targets = []
-            for percentage in percentages:
-                target = (percentage / total_percentage) * remaining_shifts
-                exact_targets.append(target)
-        
-            # Second pass: Round targets while minimizing allocation error
-            rounded_targets = []
-            leftover = 0.0
-        
-            for target in exact_targets:
-                # Add leftover from previous rounding
-                adjusted_target = target + leftover
+                    pct = float(str(w.get('work_percentage',100)).strip())/100.0
+                except Exception:
+                    logging.warning(f"Worker {wid} invalid work_percentage; defaulting to 100%")
+                pct = max(0.0, pct)
+                weights.append(available_slots.get(wid,0) * pct)
+
+            total_weight = sum(weights) or 1.0
+
+            # 4) Compute exact fractional targets
+            exact_targets = [wgt/total_weight*total_slots for wgt in weights]
+
+            # 5) Largest-remainder rounding
+            floors = [int(x) for x in exact_targets]
+            remainder = int(total_slots - sum(floors))
+            fracs = sorted(enumerate(exact_targets),
+                           key=lambda ix: exact_targets[ix[0]] - floors[ix[0]],
+                           reverse=True)
+            targets = floors[:]
+            for idx, _ in fracs[:remainder]:
+                targets[idx] += 1
+
+            # 6) Assign and log (subtract out mandatory days so they're not extra)
+            for i, w in enumerate(self.workers_data):
+                raw_target = targets[i]
+                mand_count = 0
+                mand_str = w.get('mandatory_days', '').strip()
+                if mand_str:
+                    try:
+                        mand_dates = self.date_utils.parse_dates(mand_str)
+                        mand_count = sum(1 for d in mand_dates
+                                         if self.start_date <= d <= self.end_date)
+                    except Exception as e:
+                        logging.error(f"Failed to parse mandatory_days for {w['id']}: {e}")
+                adjusted = max(0, raw_target - mand_count)
+                w['target_shifts'] = adjusted
+                logging.info(
+                    f"Worker {w['id']}: target_shifts={raw_target} → {adjusted}"
+                    f"{' (−'+str(mand_count)+' mandatory)' if mand_count else ''}"
+                )
+
+            for i,w in enumerate(self.workers_data):
+                raw = targets[i]
+                mand_count = 0
+                if w.get('mandatory_days','').strip():
+                    mand_count = sum(1 for d in self.date_utils.parse_dates(w['mandatory_days'])
+                                     if self.start_date <= d <= self.end_date)
+            w['_raw_target']      = raw
+            w['_mandatory_count'] = mand_count
+            w['target_shifts']    = max(0, raw - mand_count)
             
-                # Round to nearest integer
-                rounded = round(adjusted_target)
-            
-                # Calculate new leftover
-                leftover = adjusted_target - rounded
-            
-                # Ensure minimum of 0 non-mandatory shifts (since we add mandatory later)
-                rounded = max(0, rounded)
-            
-                rounded_targets.append(rounded)
-        
-            # Final adjustment to ensure total equals required remaining shifts
-            sum_targets = sum(rounded_targets)
-            difference = remaining_shifts - sum_targets
-        
-            if difference != 0:
-                logging.info(f"Adjusting allocation by {difference} shifts")
-            
-                # Create sorted indices based on fractional part distance from rounding threshold
-                frac_distances = [abs((t + leftover) - round(t + leftover)) for t in exact_targets]
-                sorted_indices = sorted(range(len(frac_distances)), key=lambda i: frac_distances[i], reverse=(difference > 0))
-            
-                # Add or subtract from workers with smallest rounding error first
-                for i in range(abs(difference)):
-                    adj_index = sorted_indices[i % len(sorted_indices)]
-                    rounded_targets[adj_index] += 1 if difference > 0 else -1
-                
-                    # Ensure minimums
-                    if rounded_targets[adj_index] < 0:
-                        rounded_targets[adj_index] = 0
-        
-            # Add mandatory shifts to calculated targets
-            for i, worker in enumerate(self.workers_data):
-                worker_id = worker['id']
-                # Total target = non-mandatory target + mandatory shifts
-                worker['target_shifts'] = rounded_targets[i] + mandatory_shifts_by_worker[worker_id]
-            
-                # Apply additional constraints based on work percentage
-                work_percentage = float(str(worker.get('work_percentage', 100)).strip())
-            
-                # Calculate reasonable maximum based on work percentage (excluding mandatory shifts)
-                max_reasonable = total_days * (work_percentage / 100) * 0.8
-            
-                # For target exceeding reasonable maximum, adjust non-mandatory part only
-                non_mandatory_target = worker['target_shifts'] - mandatory_shifts_by_worker[worker_id]
-                if non_mandatory_target > max_reasonable and max_reasonable >= 0:
-                    logging.warning(f"Worker {worker['id']} non-mandatory target {non_mandatory_target} exceeds reasonable maximum {max_reasonable}")
-                
-                    # Reduce target and redistribute, but preserve mandatory shifts
-                    excess = non_mandatory_target - int(max_reasonable)
-                    if excess > 0:
-                        worker['target_shifts'] = int(max_reasonable) + mandatory_shifts_by_worker[worker_id]
-                        self._redistribute_excess_shifts(excess, worker['id'], mandatory_shifts_by_worker)
-            
-                logging.info(f"Worker {worker['id']}: {work_percentage}% → {worker['target_shifts']} shifts "
-                             f"({mandatory_shifts_by_worker[worker_id]} mandatory, "
-                             f"{worker['target_shifts'] - mandatory_shifts_by_worker[worker_id]} calculated)")
-        
-            # Final verification - ensure at least 1 total shift per worker
-            for worker in self.workers_data:
-                if 'target_shifts' not in worker or worker['target_shifts'] <= 0:
-                    worker['target_shifts'] = 1
-                    logging.warning(f"Assigned minimum 1 shift to worker {worker['id']}")
-        
             return True
-    
+        
         except Exception as e:
-            logging.error(f"Error in target calculation: {str(e)}", exc_info=True)
-        
-            # Emergency fallback - equal distribution plus mandatory shifts
-            default_target = max(1, round(remaining_shifts / len(self.workers_data)))
-            for worker in self.workers_data:
-                worker_id = worker['id']
-                worker['target_shifts'] = default_target + mandatory_shifts_by_worker.get(worker_id, 0)
-        
-            logging.warning(f"Using fallback distribution: {default_target} non-mandatory shifts per worker plus mandatory shifts")
+            logging.error(f"Error in target calculation: {e}", exc_info=True)
             return False
+
+    def _adjust_for_mandatory(self):
+        """
+        Mandatory days are not extra shifts: reduce each worker's
+        target_shifts by the number of mandatories in range.
+        """
+        for w in self.workers_data:
+            mand_list = []
+            try:
+                mand_list = self.date_utils.parse_dates(w.get('mandatory_days',''))
+            except Exception:
+                pass
+
+            mand_count = sum(1 for d in mand_list
+                             if self.start_date <= d <= self.end_date)
+            # never go below zero
+            new_target = max(0, w.get('target_shifts',0) - mand_count)
+            logging.info(f"[Worker {w['id']}] target_shifts {w['target_shifts']} → {new_target} after mandatory")
+            w['target_shifts'] = new_target
 
     def _calculate_monthly_targets(self):
         """
@@ -452,7 +564,11 @@ class Scheduler:
     
         # Log the results
         logging.info("Monthly targets calculated")
-        return True  
+        return True
+
+    def _is_weekly_pattern(self, days_difference):
+        """Return True if this is a 7- or 14-day same-weekday pattern."""
+        return days_difference in (7, 14)
     
     def _redistribute_excess_shifts(self, excess_shifts, excluded_worker_id, mandatory_shifts_by_worker):
         """Helper method to redistribute excess shifts from one worker to others, respecting mandatory assignments"""
@@ -543,129 +659,157 @@ class Scheduler:
             if worker_id not in self.worker_weekends:
                 self.worker_weekends[worker_id] = []
     
-        # Ensure schedule dictionary is initialized
+        # Ensure schedule dictionary entries match variable shifts configuration
         for current_date in self._get_date_range(self.start_date, self.end_date):
+            expected = self._get_shifts_for_date(current_date)
             if current_date not in self.schedule:
-                self.schedule[current_date] = [None] * self.num_shifts
-    
+                self.schedule[current_date] = [None] * expected
+            else:
+                # Pad or trim to expected length
+                actual = len(self.schedule[current_date])
+                if actual < expected:
+                    self.schedule[current_date].extend([None] * (expected - actual))
+                elif actual > expected:
+                    self.schedule[current_date] = self.schedule[current_date][:expected]
+                    
         logging.info("Data integrity check completed")
         return True
 
     def _update_tracking_data(self, worker_id, date, post, removing=False):
         """
-        Update all tracking dictionaries when a worker is assigned OR removed.
-        Handles worker_posts, worker_weekdays, and worker_weekends.
-        Note: worker_assignments modification is handled directly in the calling
-        functions (_try_fill_empty_shifts, _balance_workloads, etc.) for atomicity.
-
-        Args:
-            worker_id: ID of the worker. Can be None if removing a placeholder.
-            date: The datetime.date object of the assignment/removal.
-            post: The post number (integer) of the assignment/removal.
-            removing (bool): If True, decrement stats/remove entries; otherwise, increment/add.
-                             Defaults to False.
+        Update all relevant tracking data structures when a worker is assigned or unassigned.
+        This includes worker_assignments, worker_posts, worker_weekdays, and worker_weekends.
+        It also calls the eligibility tracker if it exists.
         """
-        # Safety check if a None assignment is somehow passed during removal
-        if worker_id is None:
-            logging.debug(f"Skipping tracking update for None worker on {date.strftime('%Y-%m-%d')}, post {post}, removing={removing}")
-            return
+        try:
+            # Ensure basic data structures exist for the worker
+            if worker_id not in self.worker_assignments: 
+                self.worker_assignments[worker_id] = set()
+            
+            # Robust check and initialization for self.worker_posts[worker_id]
+            # Ensures it's a set even if worker_id was already a key but with a wrong type (e.g., dict)
+            if worker_id not in self.worker_posts or not isinstance(self.worker_posts.get(worker_id), set):
+                logging.warning(f"Re-initializing self.worker_posts[{worker_id}] as a set due to incorrect type.") # Optional: log this
+                self.worker_posts[worker_id] = set() 
+            
+            if worker_id not in self.worker_weekdays: 
+                self.worker_weekdays[worker_id] = {i: 0 for i in range(7)}
+            if worker_id not in self.worker_weekends: 
+                self.worker_weekends[worker_id] = [] # List of weekend/holiday dates worked
 
-        logging.debug(f"Updating tracking data for worker {worker_id} on {date.strftime('%Y-%m-%d')}, post {post}, removing={removing}")
+            if removing:
+                # Remove from worker assignments
+                if date in self.worker_assignments.get(worker_id, set()):
+                    self.worker_assignments[worker_id].remove(date)
+                
+                # Note: Removing from self.worker_posts for a specific post is not done here
+                # as self.worker_posts[worker_id] is a set of all posts worked.
+                # If a worker no longer works ANY instance of a post, that post would remain
+                # in their set unless explicitly managed or self.worker_posts is rebuilt.
 
-        # Determine the increment/decrement value for counts
-        change = -1 if removing else 1
-
-        # --- Update worker_posts ---
-        # Assumes self.worker_posts is {worker_id: {post_index: count}}
-        if worker_id in self.worker_posts:
-            current_post_count = self.worker_posts[worker_id].get(post, 0)
-            new_post_count = max(0, current_post_count + change) # Ensure count doesn't go below 0
-            self.worker_posts[worker_id][post] = new_post_count
-            logging.debug(f"Worker {worker_id} post {post} count updated to {new_post_count}")
-        elif not removing: # Only initialize if adding and worker dict doesn't exist
-            # Initialize post counts for this worker if they are being added for the first time
-            self.worker_posts[worker_id] = {p: 0 for p in range(self.num_shifts)}
-            self.worker_posts[worker_id][post] = 1 # Set initial count to 1
-            logging.debug(f"Initialized post counts for worker {worker_id}; post {post} set to 1")
-        else:
-             # Worker not found during removal, log a warning
-             logging.warning(f"Tried to update post counts for non-existent worker {worker_id} during removal.")
-
-
-        # --- Update worker_weekdays ---
-        # Assumes self.worker_weekdays is {worker_id: {weekday_index: count}}
-        weekday = date.weekday() # Monday is 0 and Sunday is 6
-        if worker_id in self.worker_weekdays:
-            current_weekday_count = self.worker_weekdays[worker_id].get(weekday, 0)
-            new_weekday_count = max(0, current_weekday_count + change) # Ensure count doesn't go below 0
-            self.worker_weekdays[worker_id][weekday] = new_weekday_count
-            logging.debug(f"Worker {worker_id} weekday {weekday} count updated to {new_weekday_count}")
-        elif not removing: # Only initialize if adding and worker dict doesn't exist
-            # Initialize weekday counts for this worker
-            self.worker_weekdays[worker_id] = {wd: 0 for wd in range(7)}
-            self.worker_weekdays[worker_id][weekday] = 1 # Set initial count to 1
-            logging.debug(f"Initialized weekday counts for worker {worker_id}; weekday {weekday} set to 1")
-        else:
-            # Worker not found during removal, log a warning
-            logging.warning(f"Tried to update weekday counts for non-existent worker {worker_id} during removal.")
+                # Update weekday counts
+                weekday = date.weekday()
+                # Ensure weekday key exists before decrementing, though init above should handle it.
+                if weekday in self.worker_weekdays.get(worker_id, {}): # Defensive access
+                    if self.worker_weekdays[worker_id][weekday] > 0:
+                        self.worker_weekdays[worker_id][weekday] -= 1
+                else:
+                    logging.warning(f"Weekday {weekday} not found in self.worker_weekdays for worker {worker_id} during removal.")
 
 
-        # --- Update worker_weekends ---
-        # Assumes self.worker_weekends is {worker_id: [date1, date2, ...]}
-        # Check if the date is a weekend (Sat/Sun) or a defined holiday
-        # Ensure self.holidays is a list or set of datetime.date objects
-        # Ensure self.date_utils exists and has is_holiday method if using holidays
-        is_weekend_day = date.weekday() >= 5 # Saturday (5) or Sunday (6)
-        is_holiday_day = hasattr(self, 'date_utils') and hasattr(self.date_utils, 'is_holiday') and self.date_utils.is_holiday(date)
-        # Alternatively, if date_utils not available/reliable:
-        # is_holiday_day = date in self.holidays
+                # Update weekend tracking
+                is_special_day = (date.weekday() >= 4 or
+                                  date in self.holidays or
+                                  (date + timedelta(days=1)) in self.holidays)
+                
+                if is_special_day:
+                    current_weekends = self.worker_weekends.get(worker_id) # Use .get for safety
+                    if current_weekends is not None and date in current_weekends:
+                        current_weekends.remove(date)
+                        # current_weekends.sort() # Re-sort if removal changes order and order matters
 
-        is_tracked_as_weekend = is_weekend_day or is_holiday_day
+            else: # Adding assignment
+                self.worker_assignments[worker_id].add(date)
+                self.worker_posts[worker_id].add(post) # This should now work
+                
+                weekday = date.weekday()
+                self.worker_weekdays[worker_id][weekday] = self.worker_weekdays[worker_id].get(weekday, 0) + 1
 
-        if is_tracked_as_weekend:
-            if worker_id in self.worker_weekends:
+
+                is_special_day = (date.weekday() >= 4 or
+                                  date in self.holidays or
+                                  (date + timedelta(days=1)) in self.holidays)
+
+                if is_special_day:
+                    current_weekends = self.worker_weekends.setdefault(worker_id, []) # Ensures list exists
+                    if date not in current_weekends:
+                        current_weekends.append(date)
+                        current_weekends.sort()
+
+            # Update eligibility tracker if it exists and is configured
+            if hasattr(self, 'eligibility_tracker') and self.eligibility_tracker:
                 if removing:
-                    # Try to remove the date if it exists in the list
-                    if date in self.worker_weekends[worker_id]:
-                        try:
-                            self.worker_weekends[worker_id].remove(date)
-                            logging.debug(f"Removed weekend/holiday date {date.strftime('%Y-%m-%d')} for worker {worker_id}")
-                        except ValueError:
-                            # Should not happen due to 'if date in ...' check, but belt-and-suspenders
-                            logging.error(f"Internal error: Date {date.strftime('%Y-%m-%d')} was in worker {worker_id}'s weekend list but remove failed.")
-                    else:
-                        logging.warning(f"Tried to remove weekend/holiday date {date.strftime('%Y-%m-%d')} for worker {worker_id}, but it was not in their list.")
-                else: # Adding
-                    # Add the date only if it's not already present
-                    if date not in self.worker_weekends[worker_id]:
-                        self.worker_weekends[worker_id].append(date)
-                        self.worker_weekends[worker_id].sort() # Keep the list sorted
-                        logging.debug(f"Added weekend/holiday date {date.strftime('%Y-%m-%d')} for worker {worker_id}")
-                    else:
-                        # Date already exists, likely due to multiple shifts on the same weekend day or re-processing
-                        logging.debug(f"Weekend/holiday date {date.strftime('%Y-%m-%d')} already present for worker {worker_id}, not adding again.")
+                    self.eligibility_tracker.remove_worker_assignment(worker_id, date)
+                else:
+                    self.eligibility_tracker.update_worker_status(worker_id, date)
 
-            elif not removing: # Initialize if adding and worker dict doesn't exist
-                # Initialize weekend list for this worker
-                self.worker_weekends[worker_id] = [date]
-                logging.debug(f"Initialized weekend/holiday list for worker {worker_id} with date {date.strftime('%Y-%m-%d')}")
-            else:
-                 # Worker not found during removal, log a warning
-                 logging.warning(f"Tried to update weekend/holiday list for non-existent worker {worker_id} during removal.")
+            logging.debug(f"{'Removed' if removing else 'Added'} assignment and updated tracking for worker {worker_id} on {date.strftime('%Y-%m-%d')}, post {post}")
 
-        # --- Update Constraint Skips (Optional) ---
-        # If removing an assignment could potentially resolve a previously logged constraint skip,
-        # you might add logic here to remove entries from self.constraint_skips.
-        # However, this is complex and often not necessary unless you explicitly need to track
-        # the *current* number of active violations. Usually, skips are logged historically.
-        # Example (conceptual):
-        # if removing and worker_id in self.constraint_skips:
-        #     # Check if removing 'date' resolves a 'gap' skip involving 'date'
-        #     # Check if removing 'date' resolves an 'incompatibility' skip involving 'date'
-        #     pass # Add specific logic if needed
-
-        logging.debug(f"Finished updating tracking data for worker {worker_id}")
-
+        except Exception as e:
+            logging.error(f"Error in _update_tracking_data for worker {worker_id}, date {date}, post {post}, removing={removing}: {str(e)}", exc_info=True)
+            raise
+        
+    def _synchronize_tracking_data(self):
+        """
+        Ensures all tracking data structures are consistent with the schedule.
+        Called by the ScheduleBuilder to maintain data integrity.
+        """
+        try:
+            logging.info("Synchronizing tracking data structures...")
+        
+            # Reset existing tracking data
+            self.worker_assignments = {w['id']: set() for w in self.workers_data}
+            self.worker_posts = {w['id']: set() for w in self.workers_data}
+            self.worker_weekdays = {w['id']: {i: 0 for i in range(7)} for w in self.workers_data}
+            self.worker_weekends = {w['id']: [] for w in self.workers_data}
+            self.worker_shift_counts = {w['id']: 0 for w in self.workers_data}
+            self.worker_weekend_counts = {w['id']: 0 for w in self.workers_data}
+        
+            # Rebuild tracking data from the current schedule
+            for date, shifts in self.schedule.items():
+                for post_idx, worker_id in enumerate(shifts):
+                    if worker_id is not None:
+                        # Update worker assignments
+                        self.worker_assignments[worker_id].add(date)
+                    
+                        # Update posts worked
+                        self.worker_posts[worker_id].add(post_idx)
+                    
+                        # Update weekday counts
+                        weekday = date.weekday()
+                        self.worker_weekdays[worker_id][weekday] = self.worker_weekdays[worker_id].get(weekday, 0) + 1
+                    
+                        # Update weekends/holidays
+                        is_weekend_or_holiday = (date.weekday() >= 4 or 
+                                              date in self.holidays or 
+                                              (date + timedelta(days=1)) in self.holidays)
+                        if is_weekend_or_holiday:
+                            if date not in self.worker_weekends[worker_id]:
+                                self.worker_weekends[worker_id].append(date)
+                            self.worker_weekend_counts[worker_id] += 1
+                    
+                        # Update shift counts
+                        self.worker_shift_counts[worker_id] += 1
+        
+            # Sort weekend dates for consistency
+            for worker_id in self.worker_weekends:
+                self.worker_weekends[worker_id].sort()
+        
+            logging.info("Tracking data synchronization complete.")
+            return True
+        except Exception as e:
+            logging.error(f"Error synchronizing tracking data: {str(e)}", exc_info=True)
+            return False
     
     def _get_date_range(self, start_date, end_date):
         """
@@ -694,17 +838,17 @@ class Scheduler:
         """
         logging.info("Cleaning up schedule...")
 
-        # Ensure all dates in the period are in the schedule
+        # Ensure each date matches its variable-shifts count
         for date in self._get_date_range(self.start_date, self.end_date):
+            expected = self._get_shifts_for_date(date)
             if date not in self.schedule:
-                self.schedule[date] = [None] * self.num_shifts
-            elif len(self.schedule[date]) < self.num_shifts:
-                # Fill missing shifts with None
-                self.schedule[date].extend([None] * (self.num_shifts - len(self.schedule[date])))
-            elif len(self.schedule[date]) > self.num_shifts:
-                # Trim excess shifts (shouldn't happen, but just in case)
-                self.schedule[date] = self.schedule[date][:self.num_shifts]
-    
+                self.schedule[date] = [None] * expected
+            else:
+                actual = len(self.schedule[date])
+                if actual < expected:
+                    self.schedule[date].extend([None] * (expected - actual))
+                elif actual > expected:
+                    self.schedule[date] = self.schedule[date][:expected]    
         # Create a sorted version of the schedule
         sorted_schedule = {}
         for date in sorted(self.schedule.keys()):
@@ -821,10 +965,9 @@ class Scheduler:
                                 too_close = True
                                 break
     
-                        # Check for 7 or 14 day patterns (same day of week)
-                        if days_difference == 7 or days_difference == 14:
+                        # Check for weekly-pattern (7 or 14 days, same weekday)
+                        if self._is_weekly_pattern(days_difference) and date.weekday() == assigned_date.weekday():
                             too_close = True
-                            break
     
                     if too_close:
                         continue
@@ -887,95 +1030,6 @@ class Scheduler:
     
         return total_assigned > 0
 
-    def _assign_mixed_strategy(self):
-        """
-        Try multiple assignment strategies and choose the best result.
-        """
-        logging.info("Using mixed strategy approach to generate optimal schedule")
-    
-        try:
-            # Strategy 1: Simple assignment
-            self._backup_best_schedule()  # Save current state
-            success1 = self._assign_workers_simple()
-        
-            # Ensure tracking is consistent
-            self._reconcile_schedule_tracking()
-        
-            coverage1 = self._calculate_coverage() if success1 else 0
-            post_rotation1 = self._calculate_post_rotation()['overall_score'] if success1 else 0
-        
-            # Create deep copies of the simple assignment result
-            simple_schedule = {}
-            for date, shifts in self.schedule.items():
-                simple_schedule[date] = shifts.copy() if shifts else []
-            
-            simple_assignments = {}
-            for worker_id, assignments in self.worker_assignments.items():
-                simple_assignments[worker_id] = set(assignments)
-        
-            logging.info(f"Simple assignment strategy: {coverage1:.1f}% coverage, {post_rotation1:.1f}% rotation")
-        
-            # Strategy 2: Cadence-based assignment
-            self._restore_best_schedule()  # Restore to original state
-            try:
-                success2 = self._assign_workers_cadence()
-            
-                # Ensure tracking is consistent
-                self._reconcile_schedule_tracking()
-            
-                coverage2 = self._calculate_coverage() if success2 else 0
-                post_rotation2 = self._calculate_post_rotation()['overall_score'] if success2 else 0
-            
-                # Create deep copies of the cadence result
-                cadence_schedule = {}
-                for date, shifts in self.schedule.items():
-                    cadence_schedule[date] = shifts.copy() if shifts else []
-                
-                cadence_assignments = {}
-                for worker_id, assignments in self.worker_assignments.items():
-                    cadence_assignments[worker_id] = set(assignments)
-                
-                logging.info(f"Cadence assignment strategy: {coverage2:.1f}% coverage, {post_rotation2:.1f}% rotation")
-            except Exception as e:
-                logging.error(f"Error in cadence assignment: {str(e)}", exc_info=True)
-                # Default to simple assignment if cadence fails
-                success2 = False
-                coverage2 = 0
-                post_rotation2 = 0
-        
-            # Compare results
-            logging.info(f"Strategy comparison: Simple ({coverage1:.1f}% coverage, {post_rotation1:.1f}% rotation) vs "
-                        f"Cadence ({coverage2:.1f}% coverage, {post_rotation2:.1f}% rotation)")
-        
-            # Choose the better strategy based on combined score (coverage is more important)
-            score1 = coverage1 * 0.7 + post_rotation1 * 0.3
-            score2 = coverage2 * 0.7 + post_rotation2 * 0.3
-        
-            if score1 >= score2 or not success2:
-                # Use simple assignment results
-                self.schedule = simple_schedule
-                self.worker_assignments = simple_assignments
-                logging.info(f"Selected simple assignment strategy (score: {score1:.1f})")
-            else:
-                # Use cadence assignment results
-                self.schedule = cadence_schedule
-                self.worker_assignments = cadence_assignments
-                logging.info(f"Selected cadence assignment strategy (score: {score2:.1f})")
-        
-            # Final reconciliation to ensure consistency
-            self._reconcile_schedule_tracking()
-        
-            # Final coverage calculation
-            final_coverage = self._calculate_coverage()
-            logging.info(f"Final mixed strategy coverage: {final_coverage:.1f}%")
-        
-            return final_coverage > 0
-        
-        except Exception as e:
-            logging.error(f"Error in mixed strategy assignment: {str(e)}", exc_info=True)
-            # Fall back to simple assignment if mixed strategy fails
-            return self._assign_workers_simple()
-
     def _check_schedule_constraints(self):
         """
         Check the current schedule for constraint violations.
@@ -1025,9 +1079,9 @@ class Scheduler:
                                 })
                     
                         # Check for 7 or 14 day patterns
-                        if days_between == 7 or days_between == 14:
+                        if (days_between == 7 or days_between == 14) and date1.weekday() == date2.weekday(): # CORRECTED LOGIC + WEEKDAY CHECK
                             violations.append({
-                                'type': 'weekly_pattern',
+                                'type': 'weekly_pattern',        # Ensure this and following lines are indented correctly
                                 'worker_id': worker_id,
                                 'date1': date1,
                                 'date2': date2,
@@ -1075,73 +1129,132 @@ class Scheduler:
             logging.error(f"Error checking schedule constraints: {str(e)}", exc_info=True)
             return []
 
-    def _is_allowed_assignment(self, worker_id, date, shift_num):
+    def _is_allowed_assignment(self, worker_id, date, shift_num): # shift_num is often unused
         """
         Check if assigning this worker to this date/shift would violate any constraints.
         Returns True if assignment is allowed, False otherwise.        
     
         Enforces:
-        - Special case: No Friday-Monday assignments (require 3 days gap)
-        - No 7 or 14 day patterns
-        - Worker incompatibility constraints
+        - Minimum gap between shifts
+        - Special case: No Friday-Monday assignments (if base gap is 1)
+        - No 7 or 14 day patterns (same weekday)
+        - Worker incompatibility constraints (basic check)
+        - Max consecutive weekends (simplified check, ideally use ConstraintChecker)
         """
         try:
-            # Check if worker is available on this date
             worker = next((w for w in self.workers_data if w['id'] == worker_id), None)
             if not worker:
+                logging.warning(f"_is_allowed_assignment: Worker {worker_id} not found in workers_data.")
+                return False
+        
+            # Check if worker is already assigned on this date (any post)
+            if date in self.schedule and worker_id in self.schedule.get(date, []):
+                logging.debug(f"_is_allowed_assignment: Worker {worker_id} already assigned on {date.strftime('%Y-%m-%d')}")
                 return False
     
-            # Check if worker is already assigned on this date
-            if worker_id in self.worker_assignments and date in self.worker_assignments[worker_id]:
-                return False
-    
-            # Check past assignments for minimum gap and patterns
-            for assigned_date in self.worker_assignments.get(worker_id, set()):
+            worker_assignments_set = self.worker_assignments.get(worker_id, set())
+            if not isinstance(worker_assignments_set, set): # Should always be a set
+                worker_assignments_set = set()
+
+            # --- SINGLE LOOP for checking against previous assignments ---
+            for assigned_date in worker_assignments_set:
+                if assigned_date == date: 
+                    continue
+
                 days_difference = abs((date - assigned_date).days)
-        
-                # Check past assignments for minimum gap and patterns
-                for assigned_date in self.worker_assignments.get(worker_id, set()):
-                    days_difference = abs((date - assigned_date).days)
     
-                    # Basic minimum gap check based on configurable parameter
-                    min_days_between = self.gap_between_shifts + 1  # +1 because we need days_difference > gap
-                    if days_difference < min_days_between:
-                        logging.debug(f"Worker {worker_id} cannot be assigned on {date} due to insufficient rest (needs at least {min_days_between} days)")
-                        return False
-        
-                    # Special case for Friday-Monday if gap is only 1 day
-                    if self.gap_between_shifts == 1 and days_difference == 3:
-                        # Check if one date is Friday (weekday 4) and the other is Monday (weekday 0)
-                        if ((assigned_date.weekday() == 4 and date.weekday() == 0) or 
-                            (assigned_date.weekday() == 0 and date.weekday() == 4)):
-                            logging.debug(f"Worker {worker_id} cannot be assigned Friday-Monday (needs at least {self.gap_between_shifts + 2} days gap)")
-                            return False
-            
-                # Check 7 or 14 day patterns (to avoid same day of week assignments)
-                if days_difference == 7 or days_difference == 14:
-                    logging.debug(f"Worker {worker_id} cannot be assigned on {date} as it would create a 7 or 14 day pattern")
+                # 1. Basic minimum gap check
+                min_days_required_between = self.gap_between_shifts + 1
+                work_percentage = worker.get('work_percentage', 100)
+                if work_percentage < 70: # Example threshold for part-time
+                     min_days_required_between = max(min_days_required_between, self.gap_between_shifts + 2)
+
+                if days_difference < min_days_required_between:
+                    logging.debug(f"_is_allowed_assignment: Worker {worker_id} on {date.strftime('%Y-%m-%d')} fails gap with {assigned_date.strftime('%Y-%m-%d')} ({days_difference} < {min_days_required_between})")
                     return False
         
-            # Check incompatibility constraints using worker data
-            incompatible_with = worker.get('incompatible_with', [])
-            if incompatible_with:
-                # Check if any incompatible worker is already assigned to this date
-                for incompatible_id in incompatible_with:
-                    if date in self.schedule and incompatible_id in self.schedule[date]:
-                        logging.debug(f"Worker {worker_id} cannot work with incompatible worker {incompatible_id} on {date}")
-                        return False
-        
-            # Use the schedule_builder's incompatibility check method
-            if not self.schedule_builder._check_incompatibility(worker_id, date):
-                return False
+                # 2. Special case for Friday-Monday (if base gap allows 3-day span)
+                if self.gap_between_shifts <= 1: 
+                    if days_difference == 3:
+                        if ((assigned_date.weekday() == 4 and date.weekday() == 0) or \
+                            (assigned_date.weekday() == 0 and date.weekday() == 4)):
+                            logging.debug(f"_is_allowed_assignment: Worker {worker_id} on {date.strftime('%Y-%m-%d')} fails Fri-Mon rule with {assigned_date.strftime('%Y-%m-%d')}")
+                            return False
+            
+                # 3. Reject 7- or 14-day same-weekday patterns
+                if self._is_weekly_pattern(days_difference) and date.weekday() == assigned_date.weekday():
+                    logging.debug(f"_is_allowed_assignment: Worker {worker_id} on {date.strftime('%Y-%m-%d')} fails 7/14 day pattern with {assigned_date.strftime('%Y-%m-%d')}")
+                    return False
+            # --- END OF SINGLE LOOP ---
+
+            # 4. Max consecutive weekends (Simplified placeholder - robust check is complex)
+            # For true robustness, this should use logic from ConstraintChecker._would_exceed_weekend_limit
+            is_current_date_special = (date.weekday() >= 4 or date in self.holidays or (date + timedelta(days=1)) in self.holidays)
+            if is_current_date_special:
+                # This is a conceptual check. A full robust check is more involved.
+                # See ConstraintChecker._would_exceed_weekend_limit for a more complete example.
+                # The ideal way is to use the constraint_checker instance if available and reliable
+                if hasattr(self, 'constraint_checker') and hasattr(self.constraint_checker, '_would_exceed_weekend_limit'):
+                    # Simulate adding the assignment for the check
+                    simulated_assignments_for_weekend_check = worker_assignments_set.copy()
+                    simulated_assignments_for_weekend_check.add(date) # Add current date to check
+                    
+                    # Temporarily replace scheduler's worker_assignments for the constraint checker
+                    # This is a bit tricky as constraint_checker usually reads from self.scheduler.worker_assignments
+                    # For an accurate check, constraint_checker might need to accept simulated assignments.
+                    # Here, we'll assume constraint_checker can be pointed to a temporary assignment set or
+                    # that its _would_exceed_weekend_limit can take the worker_id and the new date to check against current state.
+                    
+                    # Let's assume self.constraint_checker._would_exceed_weekend_limit(worker_id, date_to_add)
+                    # checks against the existing self.scheduler.worker_assignments and the new date.
+                    
+                    # Store original worker_assignments for the specific worker to restore later
+                    original_worker_specific_assignments = self.worker_assignments.get(worker_id)
+                    
+                    # Update self.worker_assignments for the check
+                    temp_assignments_for_check = self.worker_assignments.copy() # shallow copy of the dict
+                    temp_assignments_for_check[worker_id] = simulated_assignments_for_weekend_check
+                    
+                    # Temporarily point self.scheduler.worker_assignments if constraint_checker uses it directly
+                    # This is only safe if this method is not called concurrently.
+                    # A cleaner way is for _would_exceed_weekend_limit to take the full set of assignments to check.
+                    _original_scheduler_assignments = self.scheduler.worker_assignments # If scheduler has this ref
+                    self.scheduler.worker_assignments = temp_assignments_for_check 
+
+                    if self.constraint_checker._would_exceed_weekend_limit(worker_id, date): 
+                         logging.debug(f"_is_allowed_assignment: Worker {worker_id} on {date.strftime('%Y-%m-%d')} would exceed weekend limit (checked via ConstraintChecker).")
+                         self.scheduler.worker_assignments = _original_scheduler_assignments # Restore
+                         return False
+                    self.scheduler.worker_assignments = _original_scheduler_assignments # Restore
+                else:
+                    # Fallback to a very simplified local check if constraint_checker is not suitable here
+                    # This simplified check is NOT a true "max consecutive weekends" and should be improved
+                    # if ConstraintChecker cannot be used.
+                    pass # Add simplified local logic if needed, or accept it's less robust here.
+
+
+            # 5. Basic Incompatibility Check
+            assigned_on_date_others = []
+            if date in self.schedule:
+                for post_idx, assigned_w_id in enumerate(self.schedule[date]):
+                    if assigned_w_id is not None and assigned_w_id != worker_id: 
+                        assigned_on_date_others.append(assigned_w_id)
+            
+            worker_incompat_list = worker.get('incompatible_with', [])
+            for other_assigned_id in assigned_on_date_others:
+                if str(other_assigned_id) in worker_incompat_list:
+                    logging.debug(f"_is_allowed_assignment: Worker {worker_id} incompatible with {other_assigned_id} on {date.strftime('%Y-%m-%d')}")
+                    return False
+                other_worker_data = next((w for w in self.workers_data if w['id'] == other_assigned_id), None)
+                if other_worker_data and str(worker_id) in other_worker_data.get('incompatible_with', []):
+                    logging.debug(f"_is_allowed_assignment: Worker {other_assigned_id} incompatible with {worker_id} on {date.strftime('%Y-%m-%d')}")
+                    return False
     
-            # All checks passed
             return True
         except Exception as e:
-            logging.error(f"Error checking assignment constraints: {str(e)}")
-            # Default to not allowing on error
+            logging.error(f"Error in Scheduler._is_allowed_assignment for worker {worker_id} on {date}: {str(e)}", exc_info=True)
             return False
-
+        
     def _fix_constraint_violations(self):
         """
         Try to fix constraint violations in the current schedule.
@@ -1239,197 +1352,170 @@ class Scheduler:
                 worker['work_periods'] = f"{start_str} - {end_str}"
                 logging.info(f"Worker {worker['id']}: Empty work period set to full schedule period")
             
-    def generate_schedule(self, max_improvement_loops=30):
-        """
-        Generates the duty schedule.
-
-        Orchestrates the schedule generation process, including initial assignments
-        and iterative improvements.
-
-        Args:
-            max_improvement_loops (int): Maximum number of times to loop through
-                                         improvement steps if changes are still being made.
-
-        Returns:
-            bool: True if a valid schedule was successfully generated and finalized,
-                  False otherwise.
-
-        Raises:
-            SchedulerError: If a fatal error occurs during generation that prevents
-                            a schedule from being created.
-        """
+    def generate_schedule(self, max_improvement_loops=70):
         logging.info("Starting schedule generation...")
         start_time = datetime.now()
 
-        # --- 1. Initialization ---
         try:
-            # Clear previous state
-            self.schedule = {} # Initialize as empty dict first
-            self.worker_assignments = {w['id']: set() for w in self.workers_data} # Ensure keys exist
+            # 1. Initialize all of the Scheduler's own attributes for this run.
+            self.schedule = {} 
+            self.worker_assignments = {w['id']: set() for w in self.workers_data} 
             self.worker_shift_counts = {w['id']: 0 for w in self.workers_data}
-            self.worker_weekend_shifts = {w['id']: 0 for w in self.workers_data}
-            self.worker_posts = {w['id']: {} for w in self.workers_data}
-            self.last_assigned_date = {w['id']: None for w in self.workers_data}
-            self.consecutive_shifts = {w['id']: 0 for w in self.workers_data}            # Initialize any other tracking data structures
+            # Assuming self.worker_weekend_counts is the correct attribute name based on __init__
+            self.worker_weekend_counts = {w['id']: 0 for w in self.workers_data} 
+            self.worker_posts = {w['id']: set() for w in self.workers_data}
+            self.last_assignment_date = {w['id']: None for w in self.workers_data}
+            self.consecutive_shifts = {w['id']: 0 for w in self.workers_data}            
 
-            # Create ScheduleBuilder instance
+            logging.info("Initializing schedule structure with variable shift counts...")
+            self._initialize_schedule_with_variable_shifts() 
+            
             self.schedule_builder = ScheduleBuilder(self)
             logging.info("Scheduler initialized and ScheduleBuilder created.")
 
-            # --- ADDED: Initialize Schedule Structure ---
-            logging.info(f"Initializing schedule structure from {self.start_date} to {self.end_date} with {self.num_shifts} posts per day.")
-            if not self.start_date or not self.end_date or self.num_shifts is None:
-                 raise SchedulerError("Start date, end date, or num_shifts not properly initialized in Scheduler.")
-            if self.num_shifts <= 0:
-                 raise SchedulerError(f"Number of shifts per day (num_shifts) must be positive, got {self.num_shifts}.")
+            logging.debug(f"DEBUG 1 (Post-Builder-Init): self.schedule ID: {id(self.schedule)}, Keys: {list(self.schedule.keys())}") 
+            if hasattr(self, 'schedule_builder') and self.schedule_builder:
+                 logging.debug(f"DEBUG 1 (Post-Builder-Init): self.schedule_builder.schedule ID: {id(self.schedule_builder.schedule)}, Keys: {list(self.schedule_builder.schedule.keys())}")
 
-            current_date = self.start_date
-            while current_date <= self.end_date:
-                self.schedule[current_date] = [None] * self.num_shifts
-                current_date += timedelta(days=1)
-            logging.info(f"Schedule structure initialized with {len(self.schedule)} dates.")
-            # --- END ADDED ---
+            logging.info(f"Schedule structure initialized with {len(self.schedule)} dates (variable shifts applied).")
 
         except Exception as e:
             logging.exception("Initialization failed during schedule generation.")
-            # Wrap non-SchedulerErrors
             if isinstance(e, SchedulerError):
                  raise e
             else:
                  raise SchedulerError(f"Initialization failed: {str(e)}")
 
-
-        # --- 2. Assign Mandatory Shifts ---
-        try:
-            # Now self.schedule has the correct structure to place mandatory shifts
-            logging.info("Assigning mandatory shifts...")
-            self.schedule_builder._assign_mandatory_guards()
-            # Save this initial state (might have mandatory shifts now)
-            self.schedule_builder._save_current_as_best(initial=True)
-            logging.info("Mandatory shifts assigned.")
-            self.log_schedule_summary("After Mandatory Assignment") # This should now show total slots
-
-        except Exception as e:
-            # ... (error handling) ...
-            logging.exception("Error assigning mandatory guards.")
-            raise SchedulerError(f"Failed during mandatory assignment: {str(e)}")
+        # --- 2. Pre-assign mandatory shifts and lock them in place ---
+        logging.info("Pre-assigning mandatory shifts; these will be irremovable.")
+        self.schedule_builder._assign_mandatory_guards()
+        logging.debug(f"DEBUG 2 (After _assign_mandatory_guards): self.schedule keys: {list(self.schedule.keys())}, Schedule content sample: {dict(list(self.schedule.items())[:2])}")
         
+        self.schedule_builder._synchronize_tracking_data()
+        
+        self.schedule_builder._save_current_as_best(initial=True)
+        logging.debug(f"DEBUG 4 (After _save_current_as_best): self.schedule keys: {list(self.schedule.keys())}, Schedule content sample: {dict(list(self.schedule.items())[:2])}")
+        
+        self.log_schedule_summary("After Mandatory Assignment")  
+        logging.debug(f"DEBUG 5 (After log_schedule_summary): self.schedule keys: {list(self.schedule.keys())}, Schedule content sample: {dict(list(self.schedule.items())[:2])}")
+
         # --- 3. Iterative Improvement Loop ---
         improvement_loop_count = 0
-        improvement_made_in_cycle = True # Start as True to enter the loop
-
+        improvement_made_in_cycle = True 
+        
+        logging.debug(f"DEBUG 6 (BEFORE Improvement Loop WHILE): self.schedule keys: {list(self.schedule.keys())}, Schedule content sample: {dict(list(self.schedule.items())[:2])}")
+        
         try:
-            # The loop structure remains the same
             while improvement_made_in_cycle and improvement_loop_count < max_improvement_loops:
-                improvement_made_in_cycle = False
+                improvement_made_in_cycle = False # Reset for the current loop
                 logging.info(f"--- Starting Improvement Loop {improvement_loop_count + 1} ---")
+                logging.debug(f"DEBUG 7 (TOP OF Improvement Loop {improvement_loop_count + 1}): self.schedule keys: {list(self.schedule.keys())}, Schedule content sample: {dict(list(self.schedule.items())[:2])}")
                 loop_start_time = datetime.now()
 
-                # --- Run Improvement Steps ---
-                # !!! IMPORTANT: Call _try_fill_empty_shifts FIRST !!!
+                # --- MODIFICATION START: Attempt to fill empty shifts first ---
+                logging.debug(f"[generate_schedule PRE-CALL _try_fill_empty_shifts] self.schedule_builder.schedule object ID: {id(self.schedule_builder.schedule)}")
                 if self.schedule_builder._try_fill_empty_shifts():
-                    logging.info("Improvement Loop: Filled empty shifts.")
-                    improvement_made_in_cycle = True
-
-                # Now run other balancing/improvement steps
+                     logging.info("Improvement Loop: Attempted to fill empty shifts and made changes.")
+                     improvement_made_in_cycle = True
+                else:
+                    logging.info("Improvement Loop: Attempted to fill empty shifts, but no changes were made by this step.")
+                # --- MODIFICATION END ---
+                
                 if self.schedule_builder._balance_workloads():
                      logging.info("Improvement Loop: Balanced workloads.")
+                     improvement_made_in_cycle = True # If this made a change, ensure the loop continues
+                
+                if self.schedule_builder._improve_weekend_distribution(): 
+                     logging.info("Improvement Loop: Improved weekend distribution (1st call).")
                      improvement_made_in_cycle = True
 
-                if self.schedule_builder._improve_post_rotation():
-                     logging.info("Improvement Loop: Improved general post rotation.")
-                     improvement_made_in_cycle = True
+                self.schedule_builder._synchronize_tracking_data() 
+                logging.debug(f"DEBUG 8 (After _synchronize_tracking_data in loop): self.schedule keys: {list(self.schedule.keys())}, Schedule content sample: {dict(list(self.schedule.items())[:2])}")
 
-                if self.schedule_builder._balance_last_post():
-                     logging.info("Improvement Loop: Balanced last post assignments.")
-                     improvement_made_in_cycle = True
+                if self.schedule_builder._improve_weekend_distribution(): 
+                    logging.info("Improvement Loop: Improved weekend distribution (2nd call).")
+                    improvement_made_in_cycle = True
+                logging.debug(f"DEBUG 9 (After 2nd _improve_weekend_distribution in loop): self.schedule keys: {list(self.schedule.keys())}, Schedule content sample: {dict(list(self.schedule.items())[:2])}")
 
-                if self.schedule_builder._improve_weekend_distribution():
-                     logging.info("Improvement Loop: Improved weekend distribution.")
-                     improvement_made_in_cycle = True
-
-                # Add other steps like _fix_incompatibility_violations if needed
-                # if self.schedule_builder._fix_incompatibility_violations():
-                #      logging.info("Improvement Loop: Fixed incompatibilities.")
-                #      improvement_made_in_cycle = True
+                if self.schedule_builder._adjust_last_post_distribution():
+                    logging.info("Improvement Loop: Balanced last post assignments.")
+                    improvement_made_in_cycle = True
+                logging.debug(f"DEBUG 10 (After _adjust_last_post_distribution in loop): self.schedule keys: {list(self.schedule.keys())}, Schedule content sample: {dict(list(self.schedule.items())[:2])}")
 
                 loop_end_time = datetime.now()
-                logging.info(f"--- Improvement Loop {improvement_loop_count + 1} finished in {(loop_end_time - loop_start_time).total_seconds():.2f}s. Changes made: {improvement_made_in_cycle} ---")
+                logging.info(f"--- Improvement Loop {improvement_loop_count + 1} finished in {(loop_end_time - loop_start_time).total_seconds():.2f}s. Changes made in this iteration: {improvement_made_in_cycle} ---")
 
                 if not improvement_made_in_cycle:
-                    logging.info("No further improvements detected in this loop. Exiting improvement phase.")
+                    logging.info("No further improvements detected in this specific loop iteration. Exiting improvement phase.")
                 improvement_loop_count += 1
-
-                # Optional: Log schedule summary after each full loop
-                # self.log_schedule_summary(f"After Improvement Loop {improvement_loop_count}")
-
-
+            
             if improvement_loop_count >= max_improvement_loops:
                 logging.warning(f"Reached maximum improvement loops ({max_improvement_loops}). Stopping improvements.")
 
         except Exception as e:
              logging.exception("Error during schedule improvement loop.")
-             # Depending on severity, either raise or try to use the best schedule found so far
-             # Let's raise for now, as an error here indicates a problem in the logic
              raise SchedulerError(f"Failed during improvement loop {improvement_loop_count}: {str(e)}")
-
+                         
+        logging.info("Attempting final adjustment of last post distribution for non-variable shift days...")
+        if self.schedule_builder._adjust_last_post_distribution(
+            balance_tolerance=1.0, # For +/-1 overall balance
+            max_iterations=self.config.get('last_post_adjustment_max_iterations', 5) # Make configurable
+        ):
+            logging.info("Last post distribution adjusted.")
+            # Potentially re-evaluate score or save if this step is considered significant enough
+            # self.schedule_builder._save_current_as_best() # If this method makes direct changes and should be saved
 
         # --- 4. Finalization ---
         try:
             logging.info("Finalizing schedule...")
-            # Retrieve the best schedule data dictionary found by the builder
             final_schedule_data = self.schedule_builder.get_best_schedule()
+            if final_schedule_data and 'schedule' in final_schedule_data:
+                logging.debug(f"DEBUG 12 (In finalization, from get_best_schedule): final_schedule_data['schedule'] keys: {list(final_schedule_data['schedule'].keys())}")
+            else:
+                logging.debug(f"DEBUG 12 (In finalization): final_schedule_data is None or has no 'schedule' key.")
 
-            # Check if a best schedule was actually saved and if it contains schedule data
+
             if final_schedule_data is None or not final_schedule_data.get('schedule'):
                 logging.error("No best schedule was saved or the best schedule found is empty.")
-                # Fallback: Check if the current state has a schedule (maybe mandatory shifts were assigned but no improvements saved)
-                if not self.schedule or all(all(p is None for p in posts) for posts in self.schedule.values()):
-                     # If the current schedule is also empty or contains only None
+                if not self.schedule or all(all(p is None for p in posts) for posts in self.schedule.values()): 
                      logging.error("Current schedule state is also empty or contains no assignments.")
                      raise SchedulerError("Schedule generation process completed, but no valid schedule data was generated or saved.")
                 else:
-                     # Use the current state as a last resort if the builder didn't save a 'best'
                      logging.warning("Using current schedule state as final schedule; best schedule data was missing or empty.")
-                     final_schedule_data = { # Reconstruct from current state
-                          'schedule': self.schedule,
+                     final_schedule_data = { 
+                          'schedule': self.schedule, 
                           'worker_assignments': self.worker_assignments,
                           'worker_shift_counts': self.worker_shift_counts,
-                          'worker_weekend_shifts': self.worker_weekend_shifts,
+                          'worker_weekend_counts': self.worker_weekend_counts, 
                           'worker_posts': self.worker_posts,
-                          'last_assigned_date': self.last_assigned_date,
+                          'last_assignment_date': self.last_assignment_date, 
                           'consecutive_shifts': self.consecutive_shifts,
-                          'score': self.schedule_builder.calculate_score() # Recalculate score based on current state
+                          'score': self.calculate_score() 
                      }
-                     # Ensure the reconstructed data is not empty
-                     if not final_schedule_data.get('schedule'):
+                     if not final_schedule_data.get('schedule'): 
                           raise SchedulerError("Failed to reconstruct final schedule data from current state.")
 
-
-            # Update the main scheduler's state with the data from the best found schedule
             logging.info("Updating scheduler state with the selected final schedule.")
-            self.schedule = final_schedule_data['schedule']
+            self.schedule = final_schedule_data['schedule'] 
+            logging.debug(f"DEBUG 13 (After self.schedule = final_schedule_data['schedule']): self.schedule keys: {list(self.schedule.keys())}, Schedule content sample: {dict(list(self.schedule.items())[:2])}")
+
             self.worker_assignments = final_schedule_data['worker_assignments']
             self.worker_shift_counts = final_schedule_data['worker_shift_counts']
-            self.worker_weekend_shifts = final_schedule_data['worker_weekend_shifts']
+            self.worker_weekend_counts = final_schedule_data.get('worker_weekend_shifts', final_schedule_data.get('worker_weekend_counts', {})) 
             self.worker_posts = final_schedule_data['worker_posts']
-            self.last_assigned_date = final_schedule_data['last_assigned_date']
+            self.last_assignment_date = final_schedule_data['last_assignment_date'] 
             self.consecutive_shifts = final_schedule_data['consecutive_shifts']
-            final_score = final_schedule_data.get('score', float('-inf')) # Use .get for safety
+            final_score = final_schedule_data.get('score', float('-inf')) 
 
             logging.info(f"Final schedule selected with score: {final_score:.2f}")
-
-            # --- Final Validation ---
             empty_shifts_final = []
             total_slots_final = 0
             total_assignments_final = 0
 
-            # Check if the final schedule dictionary itself is empty
             if not self.schedule:
                  logging.error("CRITICAL: Final schedule dictionary (self.schedule) is empty!")
                  raise SchedulerError("Generated schedule dictionary is empty after finalization process.")
 
-            # Iterate through the final schedule to count slots and assignments
             for date, posts in self.schedule.items():
                 if not isinstance(posts, list):
                      logging.error(f"CRITICAL: Schedule entry for date {date} is not a list: {type(posts)}")
@@ -1441,39 +1527,28 @@ class Scheduler:
                     else:
                         total_assignments_final += 1
 
-            # Sanity check: If the date range is valid, we expect > 0 total slots
             schedule_duration_days = (self.end_date - self.start_date).days + 1
             if total_slots_final == 0 and schedule_duration_days > 0:
                  logging.error(f"CRITICAL: Final schedule has 0 total slots, but date range ({self.start_date} to {self.end_date}) covers {schedule_duration_days} days.")
-                 # This indicates a fundamental failure, likely during schedule structure initialization or retrieval
                  raise SchedulerError("Generated schedule has zero total slots despite a valid date range.")
             elif total_slots_final > 0 and total_assignments_final == 0:
                  logging.warning(f"Final schedule has {total_slots_final} slots but contains ZERO assignments.")
-                 # This might be acceptable if constraints are impossible, but it's suspicious.
 
-            # Report remaining empty shifts
             if empty_shifts_final:
                 logging.warning(f"Final schedule has {len(empty_shifts_final)} empty shifts remaining out of {total_slots_final} total slots.")
-                # Depending on requirements, you might return False or raise an error here.
-                # For now, we proceed but log the warning.
-                # Example: if len(empty_shifts_final) > allowed_empty_threshold: return False
 
-            # Log summary of the final schedule state
             self.log_schedule_summary("Final Generated Schedule")
-
             end_time = datetime.now()
             logging.info(f"Schedule generation completed successfully in {(end_time - start_time).total_seconds():.2f} seconds.")
-            # Return True indicating the process finished, even if the schedule has empty slots
             return True
 
         except Exception as e:
-            # Catch any exception during finalization
             logging.exception("Error during schedule finalization.")
-            # Re-raise SchedulerError directly, wrap others
             if isinstance(e, SchedulerError):
                 raise e
             else:
                 raise SchedulerError(f"Failed during finalization: {str(e)}")
+   
     def log_schedule_summary(self, title="Schedule Summary"):
         """ Helper method to log key statistics about the current schedule state. """
         logging.info(f"--- {title} ---")
@@ -1493,14 +1568,31 @@ class Scheduler:
                  logging.info(f"  Worker {worker_id}: {count} shifts")
 
             logging.info("Weekend Shifts per Worker:")
-            for worker_id, count in sorted(self.worker_weekend_shifts.items()):
+            for worker_id, count in sorted(self.worker_weekend_counts.items()):
                  logging.info(f"  Worker {worker_id}: {count} weekend shifts")
 
             logging.info("Post Assignments per Worker:")
-            for worker_id, posts_dict in sorted(self.worker_posts.items()):
-                 if posts_dict: # Only log if worker has assignments
-                      logging.info(f"  Worker {worker_id}: {dict(sorted(posts_dict.items()))}")
-
+            for worker_id in sorted(self.worker_posts.keys()):
+                posts_set = self.worker_posts[worker_id]
+                if posts_set: # Only log if worker has assignments
+                    # Convert set to sorted list for display
+                    posts_list = sorted(list(posts_set))
+        
+                    # Count how many times each post was worked
+                    post_counts = {}
+                    for date, shifts in self.schedule.items():
+                        for post_idx, assigned_worker in enumerate(shifts):
+                            if assigned_worker == worker_id:
+                                post_counts[post_idx] = post_counts.get(post_idx, 0) + 1
+        
+                    # Display both the posts worked and their counts
+                    post_details = []
+                    for post in posts_list:
+                        count = post_counts.get(post, 0)
+                        post_details.append(f"P{post}({count})")
+        
+                    logging.info(f"  Worker {worker_id}: {', '.join(post_details)}")
+                    
             # Add more stats as needed (e.g., consecutive shifts, score)
             current_score = self.schedule_builder.calculate_score(self.schedule, self.worker_assignments) # Assuming calculate_score uses current state
             logging.info(f"Current Schedule Score: {current_score}")
@@ -1510,6 +1602,46 @@ class Scheduler:
             logging.error(f"Error generating schedule summary: {e}")
         logging.info(f"--- End {title} ---")
 
+    def calculate_score(self, schedule_to_score=None, assignments_to_score=None):
+        """
+        Calculate the score of the given schedule.
+        This is a placeholder and should be implemented with actual scoring logic.
+        """
+        logging.debug("Scheduler.calculate_score called (placeholder)")
+        # Placeholder scoring logic:
+        # For example, count filled shifts, penalize constraint violations, etc.
+        score = 0
+        
+        current_schedule = schedule_to_score if schedule_to_score is not None else self.schedule
+        current_assignments = assignments_to_score if assignments_to_score is not None else self.worker_assignments
+
+        if not current_schedule:
+            return float('-inf') # Or 0, depending on how you want to score empty schedules
+
+        filled_shifts = 0
+        total_possible_shifts = 0
+
+        for date, shifts in current_schedule.items():
+            total_possible_shifts += len(shifts)
+            for worker_id in shifts:
+                if worker_id is not None:
+                    filled_shifts += 1
+        
+        # Basic score: percentage of filled shifts
+        if total_possible_shifts > 0:
+            score = (filled_shifts / total_possible_shifts) * 100
+        else:
+            score = 0 # Or float('-inf') if an empty schedule structure is invalid
+
+        # Add penalties for constraint violations (conceptual)
+        # if hasattr(self, 'constraint_checker'):
+        #     violations = self.constraint_checker.check_all_constraints(current_schedule, current_assignments)
+        #     score -= len(violations) * 10 # Example penalty
+
+        # Add bonuses for desired properties (e.g., balanced workload, good post rotation)
+
+        logging.debug(f"Calculated score (placeholder): {score}")
+        return score
 
     def validate_and_fix_final_schedule(self):
         """
